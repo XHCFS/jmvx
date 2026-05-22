@@ -2,6 +2,7 @@ package edu.uic.cs.jmvx.runtime;
 
 import edu.uic.cs.jmvx.runtime.strategy.Follower;
 import edu.uic.cs.jmvx.runtime.strategy.HandlerStatus;
+import edu.uic.cs.jmvx.runtime.strategy.Metadata;
 import org.apache.log4j.Logger;
 
 import java.io.IOException;
@@ -31,13 +32,13 @@ public interface DivergenceHandler {
         throw new DivergenceError();
     }
 
-    public default HandlerStatus<Integer> handleReadDivergence(List<StackTraceElement> stack, Follower.Metadata metadata) {
+    public default HandlerStatus<Integer> handleReadDivergence(List<StackTraceElement> stack, Metadata metadata) {
         log.warn("external read divergence handler called.");
         JMVXRuntime.enter();
         throw new DivergenceError();
     }
 
-    public default HandlerStatus<Integer> handleWriteDivergence(List<StackTraceElement> stack, Follower.Metadata metadata) {
+    public default HandlerStatus<Integer> handleWriteDivergence(List<StackTraceElement> stack, Metadata metadata) {
         log.warn("external write divergence handler called.");
         JMVXRuntime.enter();
         throw new DivergenceError();

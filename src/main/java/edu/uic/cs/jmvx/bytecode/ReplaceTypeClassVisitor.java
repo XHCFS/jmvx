@@ -1,11 +1,14 @@
 package edu.uic.cs.jmvx.bytecode;
 
+import edu.uic.cs.jmvx.runtime.JMVXRuntime;
+import edu.uic.cs.jmvx.runtime.pools.JMVXCompletionService;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
 
 import java.util.*;
+import java.util.concurrent.ExecutorCompletionService;
 
 public class ReplaceTypeClassVisitor extends ClassVisitor implements Opcodes {
 
@@ -14,6 +17,9 @@ public class ReplaceTypeClassVisitor extends ClassVisitor implements Opcodes {
         //replace hashmaps and sets with their linked variants
         replacements.put(Type.getInternalName(HashMap.class), Type.getInternalName(LinkedHashMap.class));
         replacements.put(Type.getInternalName(HashSet.class), Type.getInternalName(LinkedHashSet.class));
+        //ExecutorCompletionService to JMVXExecutorCompletionService
+        if(PreMain.parameters.sync) //only need to instrument if instrumenting sync'ed ops
+            replacements.put(Type.getInternalName(ExecutorCompletionService.class), Type.getInternalName(JMVXCompletionService.class));
     }
     private boolean enabled = false;
 

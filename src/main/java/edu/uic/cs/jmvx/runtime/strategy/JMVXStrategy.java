@@ -14,10 +14,13 @@ import java.nio.file.CopyOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileAttribute;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadFactory;
+
+import edu.uic.cs.jmvx.runtime.pools.*;
 import sun.nio.fs.UnixPath;
 import sun.nio.fs.UnixException;
 import sun.nio.fs.UnixFileAttributes;
-import sun.nio.fs.UnixNativeDispatcher;
 
 public interface JMVXStrategy {
 
@@ -163,7 +166,7 @@ public interface JMVXStrategy {
     public void exitLogic();
 
     public default void systemExit(int status){
-        JMVXRuntime.exitMain();
+        JMVXRuntime.exitMain(null);
     }
 
     //timing methods
@@ -359,4 +362,21 @@ public interface JMVXStrategy {
     void preClose(JMVXFileDispatcherImpl impl, FileDescriptor fd) throws IOException;
 
     String getSystemTimeZoneID(String javaHome);
+
+    //For ThreadPoolExecutor Run before and after a task
+    default void beforeExecute(Thread t, JMVXJob r) {}
+    default void afterExecute(JMVXJob r, Throwable t) {}
+    /* Bit of a hack. These are supposed to return futures.
+    But rather than deal with all the bytecode of generating the future,
+    this function will act as a hook. We get into JMVX long enough to prep
+    the runnable for logging and then pass control back to the executor service
+    which will return the future
+
+    These are not supported by default so that the original leader/follower and recorder/replayer
+    do not need to be modified.
+     */
+    default void submit(JMVXJob task) { }
+    default void runnableFutureDone(JMVXQueueingFuture future){ }
+    public ExecutorService newFixedThreadPool(int nThreads, ThreadFactory threadFactory);
+    public ExecutorService newCachedThreadPool(ThreadFactory threadFactory);
 }

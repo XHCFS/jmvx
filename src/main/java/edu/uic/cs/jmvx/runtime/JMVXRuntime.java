@@ -1,9 +1,12 @@
 package edu.uic.cs.jmvx.runtime;
 
+import edu.uic.cs.jmvx.runtime.pools.JMVXJob;
+import edu.uic.cs.jmvx.runtime.pools.JMVXQueueingFuture;
 import edu.uic.cs.jmvx.runtime.strategy.*;
-import edu.uic.cs.jmvx.vectorclock.BackoffVectorClock;
-import edu.uic.cs.jmvx.vectorclock.VectorClock;
+import edu.uic.cs.jmvx.runtime.util.JMVXParameters;
+import edu.uic.cs.jmvx.vectorclock.*;
 import edu.uic.cs.jmvx.circularbuffer.CircularBuffer;
+
 import org.apache.log4j.Logger;
 import org.objectweb.asm.Type;
 import sun.misc.Unsafe;
@@ -30,44 +33,36 @@ import java.nio.file.spi.FileSystemProvider;
 import java.security.CodeSource;
 import java.security.SecureClassLoader;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.ZipFile;
 
 public class JMVXRuntime {
     public static boolean initialized = false;
+    /*
+    Cannot initialize `log` here.
+    JMVXRuntime gets loaded too early in VM's life,
+    so we'll fail to load classes needed for the Logger if we
+    try to set this here.
+    Instead, `log` is set in `$JMVX$main`.
+    There is also a hot fix in `initISStrategy` for when `log` = null
+    as a byproduct of running programs in the `Analyzer` package which load
+    JMVXRuntime, but do not have an instrumented `main` method.
+     */
     private static Logger log;
     public static final String ROLE_PROP_NAME = "jmvx.role";
+    public static final String LOGFILE_PROP_NAME = "logfile";
     private static final String SYNC_PROP_NAME = "jmvx.sync";
     public static final String Prefix = "$JMVX$";
 
-    public final static VectorClock clock = new BackoffVectorClock();
+    public static VectorClock clock; //can't be final because it is set from a parameter during $JMVX$main
     public static AtomicInteger mainCalls = new AtomicInteger(0);
-    public static volatile long currentTime = 0;
+    public static volatile boolean exiting = false;
     public static HashMap<String, Integer> threadNames = new HashMap<>();
     public static volatile Thread mainThread;
 
 //    public static final boolean checksumCommunicationEnabled = Boolean.parseBoolean(System.getProperty("checksumCommunicationEnabled", "true"));
-    public static final boolean checksumCommunicationEnabled = Boolean.parseBoolean(System.getProperty("checksumCommunicationEnabled", "0"));
-    public static final boolean consoleLogsEnabled = Boolean.parseBoolean(System.getProperty("consoleLogsEnabled", "true"));
-    public static final boolean readsFromDisk = Boolean.parseBoolean(System.getProperty("readsFromDisk", "0"));
-    public static boolean circularBufferCommunicationEnabled = Boolean.parseBoolean(System.getProperty("circularBufferCommunicationEnabled", "true"));
-    public static final long mappedMemorySize = Long.parseLong(System.getProperty("mappedMemorySize", "819200000"));
-//    public static final long mappedMemorySize = Long.parseLong(System.getProperty("mappedMemorySize", "50000"));
-    public static boolean avoidObjectSerialization = Boolean.parseBoolean(System.getProperty("avoidObjectSerialization", "true"));
-//    public static boolean avoidObjectSerialization = Boolean.parseBoolean(System.getProperty("avoidObjectSerialization", "0"));
-    public static final boolean sync = Boolean.parseBoolean(System.getProperty("sync", "true"));
-    public static boolean useBufferBackedStreams = Boolean.parseBoolean(System.getProperty("useBufferBackedStreams", "true"));
-    public static boolean deleteMmapOnDisk = Boolean.parseBoolean(System.getProperty("deleteMmapOnDisk", "true"));
-    public static boolean coreDumpAtEnd = Boolean.parseBoolean(System.getProperty("coreDumpAtEnd", "false"));
-    public static boolean logNatives = Boolean.parseBoolean(System.getProperty("logNatives", "false"));
-    public static int junkPort = Integer.parseInt(System.getProperty("junkPort", "9999"));
+    public static JMVXParameters parameters; //initialize later
     //  file, path
     public static Map<JMVXFileOutputStream, String> openedFiles = new ConcurrentHashMap<>();
 
@@ -76,6 +71,7 @@ public class JMVXRuntime {
 
     //used to redirect calls from zip files
     public static JMVXZipFile zipfile;
+    public static Class<?> zipFileInputStreamClass;
 
     static {
         Class<?> unsafeClass = Unsafe.class;
@@ -99,7 +95,7 @@ public class JMVXRuntime {
 
     public static CircularBuffer mmapFile(boolean leader) {
         CircularBuffer buffer = null;
-        buffer = new CircularBuffer(mappedMemorySize, leader);
+        buffer = new CircularBuffer(parameters.mappedMemorySize, leader);
         return buffer;
     }
 
@@ -144,7 +140,7 @@ public class JMVXRuntime {
     private static ThreadLocal topLevel = null;
     private static JMVXStrategy preInit = new SingleLeaderWithoutCoordinator();
 
-    static JMVXStrategy getStrategy() {
+    public static JMVXStrategy getStrategy() {
         if (!initialized)
             return preInit;
         else
@@ -164,16 +160,51 @@ public class JMVXRuntime {
     }
 
     private static JMVXStrategy initISStrategy() {
-        String role = System.getProperty(ROLE_PROP_NAME);
+        /*
+        JMVX standalone tools (eg the Recording analyzer or system call analyzer) are not instrumented
+        This means their main methods do not call $JMVX$main and parameters is not initialized.
+        However, the Recording analyzer needs to load JMVX when processing a recording (to load necessary classes).
+        This check is a hotfix to allow those programs to run, without properly setting the parameters
+        Arguably, we could also just process the parameters here and execute the rest of the body...
+         */
+        if(parameters == null) {
+            if(log == null)
+                log = Logger.getLogger(JMVXRuntime.class); //idempotent?
+            log.warn("Parameters not initialized");
+            log.warn("Assuming we are running an uninstrumened tool internal to JMVX");
+            log.warn("Defaulting to default role: " + getStrategy().getClass().getSimpleName());
+            return new SingleLeaderWithoutCoordinator();
+        }
+
+        //log is not volatile, code may run multiple times
+        if(log == null){ //hot fix
+            /*happens when we run Analyzer classes
+            JMVX and instrumented rt.jar are loaded so that
+            log files are read correctly.
+            However, no `main` method is invoked, so JMVXRuntime
+            is not initialized and the `log` field is null.
+
+            However, JMVX still sets initial strategies for threads
+            e.g., for worker threads in RRReader
+            */
+            //needed for log4j to properly parse the logfile
+            System.setProperty(LOGFILE_PROP_NAME, parameters.logfile);
+            log = Logger.getLogger(JMVXRuntime.class); //idempotent?
+        }
+
+        //if we are exiting, we want to use singler leader
+        String role = exiting ? SingleLeaderWithoutCoordinator.class.getSimpleName() : parameters.role;
+
         if (role != null) {
             /**
              * Set cirular buffer communicatoin to false if set to true while running recorder.
              */
-            if(circularBufferCommunicationEnabled && (role.equalsIgnoreCase("Recorder")
+            if(parameters.circularBufferCommunicationEnabled && (role.equalsIgnoreCase("Recorder")
                     || role.equalsIgnoreCase("Replayer"))) {
-                log.debug("Cannot use cirular buffer for communication with recorder.");
-                log.debug("Communication via circular buffer set to false.");
-                circularBufferCommunicationEnabled = false;
+                log.debug("Cannot use cirular buffer for communication with recorder, parameter will be ignored");
+                //log.debug("Communication via circular buffer set to false.");
+                //throw new IllegalArgumentException("");
+                //parameters.circularBufferCommunicationEnabled = false;
             }
 
             //get rid of slashes in the name
@@ -198,14 +229,14 @@ public class JMVXRuntime {
             }
 
             // Make sure the locales are initialized
-            new Formatter().format("");
+            new Formatter().format(""); //why does it keep reinitializing the decimal symbols?
 
             try {
                 Class<?> roleClass = Class.forName(JMVXStrategy.class.getPackage().getName() + "." + role);
                 JMVXStrategy temp = (JMVXStrategy) roleClass.newInstance();
                 temp.main();
                 log.info("Using role: " + temp.getClass().getSimpleName());
-                temp = new ReentrantStrategy(temp);
+                temp = ReentrantStrategy.singleLeaderPassthrough(temp);
                 return temp;
             } catch (ReflectiveOperationException e) {
                 log.warn("Could not find role: " + role, e);
@@ -270,6 +301,7 @@ public class JMVXRuntime {
         }
     }
 
+    @Deprecated
     public static void coreDump(){
         JMVXRuntime.enter();
         RuntimeMXBean run = ManagementFactory.getRuntimeMXBean();
@@ -285,16 +317,39 @@ public class JMVXRuntime {
         if (initialized)
             return;
 
+        //parses system parameters
+        parameters = new JMVXParameters();
+
+        try {
+            Class<?> vcConstructor =
+                    Class.forName(VectorClock.class.getPackage().getName() + "." + parameters.vectorclock);
+            clock = (VectorClock) vcConstructor.newInstance();
+        } catch (IllegalAccessException | ClassNotFoundException | ClassCastException | InstantiationException e) {
+            throw new RuntimeException("Failed to create vector clock", e);
+        }
+
         try {
             //handle to call zip file native methods elsewhere. see doc comment in ZipFileClassVisitor for more.
             zipfile = (JMVXZipFile) JMVXRuntime.unsafe.allocateInstance(ZipFile.class);
+
+            Optional<Class<?>> maybeZipFileInputStream = Arrays.stream(ZipFile.class.getDeclaredClasses()).
+                    filter((clazz) -> clazz.getSimpleName().equals("ZipFileInputStream")).
+                    findFirst();
+            if(maybeZipFileInputStream.isPresent()){
+                zipFileInputStreamClass = maybeZipFileInputStream.get();
+            }else{
+                throw new Error("Failed to get class reference for ZipFileInputStream");
+            }
         } catch (ClassCastException | InstantiationException e) {
             //fails when instrumenting (with class cast), but we pass through
+            log.warn("Failed to initialize JMVXRuntime.zipFile. Fine if instrumenting or coordinating");
         }
 
-        if(coreDumpAtEnd){
+        /* Disabled because it can cause deadlock on follower/replayer roles
+         * Alternate way to trigger similar behavior is the uninstrumented Dacapo callback CoreDumpCallback.
+        if(parameters.coreDumpAtEnd) {
             Runtime.getRuntime().addShutdownHook(new Thread(JMVXRuntime::coreDump));
-        }
+        }*/
 
         /*putting data in a concurrent hash map MAY initialize
           ThreadLocalRandom, which can create a divergence.
@@ -303,9 +358,16 @@ public class JMVXRuntime {
           between leader/follower and recorder/replayer, but that should be
           okay because it is used mainly for ConcurrentHashMaps, which do not
           cause our benchmarks to fail.
+
+          Seed computation relies on System.currentTimeMillis/System.nanoTime
+          Initializing ThreadLocalRandom plays a role in the computation of other seeds.
+          if initialized = false, we defer to SingleLeader, so we miss seed initialization here
+          If we move this after initialized is set to true (end of this method),
+          we see the seed creation for the `main` thread.
+          We would still need to solve this in non-main threads.
         */
         ThreadLocalRandom.current();
-        log = Logger.getLogger(JMVXRuntime.class);
+        //log = Logger.getLogger(JMVXRuntime.class);
 
         try {
             InetAddress.getLocalHost().getHostName();
@@ -329,7 +391,7 @@ public class JMVXRuntime {
 
         // Set the strategy for the current thread
         strategy.set(in);
-        if (!JMVXRuntime.sync)
+        if (!parameters.sync)
             strategy = new ThreadLocal<JMVXStrategy>(){
                 @Override
                 public JMVXStrategy get() {
@@ -353,20 +415,44 @@ public class JMVXRuntime {
             strategy = new ReentrantStrategy(strategy);
         }*/
         //JMVX can ignore the value of the property at runtime, so we reset it here.
-        logNatives = Boolean.parseBoolean(System.getProperty("logNatives", "false"));
-	if(logNatives){
+        if(parameters.logNatives) {
             JMVXNativeDetector.registerHandler();
-	}
+        }
 
         initialized = true;
     }
 
-    public static void exitMain(){
+    /*
+    Added for backwards compatibility for saved PLDI 2026 recordings which did not yet have this feature
+    Recall that the recording caches code, which was instrumented according to the prior version which did not
+    pass an exception in here
+     */
+    @Deprecated
+    public static void exitMain() {
+        exitMain(null);
+    }
+
+    public static void exitMain(Throwable t){
         if(mainCalls.getAndDecrement() == 1){
+            if(t != null) {
+                try {
+		    JMVXRuntime.enter();
+                    System.out.println("main exiting with error:");
+                    Throwable cur = t;
+                    int limit = 1; //adjust limit to see more exceptions
+                    while(cur != null && limit > 0){
+                        cur.printStackTrace();
+                        System.out.println("==");
+                        cur = cur.getCause();
+                        limit--;
+                    }
+                } finally {
+                    JMVXRuntime.exit();
+                }
+            }
             JMVXNativeDetector.logStacks();
             getStrategy().exitLogic();
         }
-        //while(true);
     }
 
     public static int read(InputStream is) throws IOException {
@@ -604,7 +690,7 @@ public class JMVXRuntime {
                     topLevel.set(r);  
                     //let threads created to handler sigterm and sigint run without instrumentation
                     if(t.getName().contains("TERM") || t.getName().contains("INT"))
-			    System.setProperty(ROLE_PROP_NAME, SingleLeaderWithoutCoordinator.class.getSimpleName());
+                        exiting = true;
                     return;
                 }
             }
@@ -754,25 +840,29 @@ public class JMVXRuntime {
 
     public static void systemExit(int status){
         //skips shutdown threads
-        System.setProperty(ROLE_PROP_NAME, SingleLeaderWithoutCoordinator.class.getSimpleName());
+        exiting = true;
         getStrategy().systemExit(status);
     }
 
     public static ExecutorService newCachedThreadPool() {
-        // Increase timeout from 1min to 5min
-        // Only allow for 1 thread max
-        return new ThreadPoolExecutor(0, 1,
-                5L*60L, TimeUnit.SECONDS,
-                new LinkedBlockingQueue<>());
+        return newCachedThreadPool(null);
     }
 
     public static ExecutorService newCachedThreadPool(ThreadFactory threadFactory) {
-        // Increase timeout from 1min to 5min
-        // Only allow for 1 thread max
-        return new ThreadPoolExecutor(0, 1,
-                5L*60L, TimeUnit.SECONDS,
-                new LinkedBlockingQueue<>(),
-                threadFactory);
+        return getStrategy().newCachedThreadPool(threadFactory);
+    }
+
+    //debug hack for systems without taskset as jme which ignores the -t flag
+    private static int nThreadsOverride = 0;
+
+    public static ExecutorService newFixedThreadPool(int nThreads) {
+        return newFixedThreadPool(nThreads, null);
+    }
+
+    public static ExecutorService newFixedThreadPool(int nThreads, ThreadFactory threadFactory) {
+        if(nThreadsOverride > 0)
+            nThreads = nThreadsOverride;
+        return getStrategy().newFixedThreadPool(nThreads, threadFactory);
     }
 
     public static void initIDs(){
@@ -904,5 +994,19 @@ public class JMVXRuntime {
 
     public static String getSystemTimeZoneID(String javaHome){
         return getStrategy().getSystemTimeZoneID(javaHome);
+    }
+
+    public static void beforeExecute(Thread t, JMVXJob r) {
+        getStrategy().beforeExecute(t, r);
+    }
+    public static void afterExecute(JMVXJob r, Throwable t) {
+        getStrategy().afterExecute(r, t);
+    }
+
+    public static void submit(JMVXJob job){
+        getStrategy().submit(job);
+    }
+    public static void runnableFutureDone(JMVXQueueingFuture future){
+        getStrategy().runnableFutureDone(future);
     }
 }

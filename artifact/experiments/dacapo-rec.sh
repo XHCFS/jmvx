@@ -2,7 +2,7 @@
 
 #BMS=("avrora" "batik" "fop" "h2" "jython" "luindex" "lusearch" "pmd" "sunflow" "xalan")
 BMS=("h2" "luindex" "lusearch")
-COLS=("vanilla" "nosync" "rec" "rep")
+COLS=("vanilla" "vanilla-preserve" "nosync" "rec" "rec-preserve") # "old" is another valid option, but not tested by default
 RESULTS_DIR="results"
 
 if [ "$1" != "all" ]; then
@@ -40,7 +40,8 @@ exptemplate() {
     if [[ " ${COLS[*]} " =~ "$MODE" ]]; then
         for B in ${BMS[@]}; do
             LOG="$RESULTS_DIR/$LOGPREFIX-$B.txt"
-            CMD="$TASKSET_LEADER $TIMEOUT $SCRIPT_DIR/$SCRIPT $B $DACAPO_ARGS"
+            SUMMARY="$RESULTS_DIR/summary-$B.txt"
+            CMD="$TASKSET_LEADER $TIME $TIMEOUT $SCRIPT_DIR/$SCRIPT $B $DACAPO_ARGS"
             echo "" > $LOG
             for I in $(seq $N); do
                 echo "Executing $MODE $B run $I"
@@ -50,6 +51,11 @@ exptemplate() {
                 
 		echo "$CMD" |& tee -a $LOG
 		eval "$CMD" |& tee -a $LOG
+
+                
+                ANALYSIS="scripts/analyzer.sh Summary rec"
+                echo "$ANALYSIS" |& tee -a $SUMMARY
+                eval "$ANALYSIS" |& tee -a $SUMMARY
                 
 		gzip rec/*.dat
 		ls -lah rec |& tee -a $LOG
@@ -62,6 +68,11 @@ exptemplate() {
 #note, this causes vanilla to make and delete a rec directory
 #but it doesn't matter
 exptemplate "vanilla" "run-vanilla.sh" "vanilla-rec"
-exptemplate "rec" "run-recorder.sh" "jmvx-rec"
+exptemplate "old" "run-recorder.sh" "jmvx-rec-old"
+exptemplate "rec" "run-recorder-pools.sh" "jmvx-rec"
 exptemplate "nosync" "run-recorder-nosync.sh" "jmvx-rec-nosync"
 
+#preserve flag is needed for the following test
+DACAPO_ARGS="$DACAPO_ARGS --preserve"
+exptemplate "vanilla-preserve" "run-vanilla.sh" "vanilla-preserve-rec"
+exptemplate "rec-preserve" "run-recorder-pools.sh" "jmvx-preserve-rec"

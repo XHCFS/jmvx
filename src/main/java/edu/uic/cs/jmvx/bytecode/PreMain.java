@@ -8,6 +8,7 @@ import java.security.ProtectionDomain;
 import java.util.*;
 
 import edu.uic.cs.jmvx.runtime.JMVXRuntime;
+import edu.uic.cs.jmvx.runtime.util.JMVXParameters;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
@@ -29,6 +30,9 @@ import org.objectweb.asm.util.TraceClassVisitor;
 
 public class PreMain implements Opcodes{
 
+	//need to parse these
+	public static JMVXParameters parameters = new JMVXParameters();
+
 	private static final class HackyClassWriter extends ClassWriter {
 
 		private HackyClassWriter(ClassReader classReader, int flags) {
@@ -41,6 +45,7 @@ public class PreMain implements Opcodes{
 	}
 
 	public static class JMVXTransformer implements ClassFileTransformer {
+
 		@Override
 		public byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined, ProtectionDomain protectionDomain, byte[] classfileBuffer) throws IllegalClassFormatException {
 		    // Information gathered during class analysis
@@ -79,10 +84,10 @@ public class PreMain implements Opcodes{
 				cv = new OutputStreamClassVisitor(optLoader, cv);
 				cv = new SocketInputStreamClassVisitor(optLoader, cv);
 				cv = new SocketOutputStreamClassVisitor(optLoader, cv);
-				if (JMVXRuntime.sync){
+				if (parameters.sync){
 					cv = new MonitorClassVisitor(optLoader, cv);
 					cv = new MakeSynchronizedClassVisitor(cv);
-					cv = new ThreadPoolExecutorClassVisitor(cv);
+					cv = new ExecutorsClassVisitor(cv);
 				}
 				cv = new FileOutputStreamClassVisitor(optLoader, cv);
 				cv = new FileInputStreamClassVisitor(optLoader, cv);
@@ -105,7 +110,7 @@ public class PreMain implements Opcodes{
 				cv = new FileSystemProviderClassVisitor(optLoader, cv);
 				cv = new SecureClassLoaderClassVisitor(optLoader, cv);
 				cv = new JarFileCacheClassVisitor(cv);
-				if(JMVXRuntime.logNatives)
+				if(parameters.logNatives)
 					cv = new NativeMethodIntercepter(cn, cv);
 				//these change the access flags on classes and natives
 				//so they have to be after nativeMethodInterceptor
@@ -117,6 +122,7 @@ public class PreMain implements Opcodes{
 				cv = new TimeZoneClassVisitor(cv);
 				cv = new ZipFileClassVisitor(cv);
 				cv = new JarFileClassVisitor(cv);
+				cv = new InjectUIDedObject(optLoader, cv);
 
 				cr.accept(cv, 0);
 
@@ -153,7 +159,7 @@ public class PreMain implements Opcodes{
 			ClassVisitor cv2 = new ThreadRunClassVisitor(loader, cw2);
 			cv2 = new InterceptMainMethodClassVisitor(cv2);
 			cv2 = new clinitClassVisitor(optLoader, cv2);
-			if (JMVXRuntime.sync)
+			if (parameters.sync)
 				cv2 = new SynchronizedClassVisitor(loader, cv2);
 
 			cr2.accept(cv2, 0);

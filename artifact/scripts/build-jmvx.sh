@@ -8,6 +8,6 @@ fi
 pushd $JMVX_DIR
 {
     mvn clean
-    mvn package
+    mvn package $*
 }
 popd

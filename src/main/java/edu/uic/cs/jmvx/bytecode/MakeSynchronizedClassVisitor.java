@@ -3,8 +3,11 @@ package edu.uic.cs.jmvx.bytecode;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.Type;
 
 import java.util.HashMap;
+import java.util.Random;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Used to make methods that aren't synchronized synchronized.
@@ -27,7 +30,14 @@ public class MakeSynchronizedClassVisitor extends ClassVisitor implements Opcode
         //race to put data in the cache (in Xalan). First thread has different operations than all others after
         toFix.put("org/apache/xml/serializer/CharInfo", "getCharInfo");
         //ensure tasks finish in the same order as leader/recording
-        toFix.put("java/util/concurrent/ExecutorCompletionService$QueueingFuture", "done");
+        //TODO put a switch here, so MVX mode can still use this
+        //AH we do need to merge the instrumentation so MVX can still work....
+        //toFix.put("java/util/concurrent/ExecutorCompletionService$QueueingFuture", "done");
+
+        //CAS to set seedUniquifier field, used in computation of future seeds
+        //toFix.put(Type.getInternalName(Random.class), "seedUniquifier");
+        //AtomicInteger use and modification when computing seed. Order of initialization effects future seeds
+        //toFix.put((Type.getInternalName(ThreadLocalRandom.class)), "localInit");
     }
 
     public MakeSynchronizedClassVisitor(org.objectweb.asm.ClassVisitor classVisitor) {

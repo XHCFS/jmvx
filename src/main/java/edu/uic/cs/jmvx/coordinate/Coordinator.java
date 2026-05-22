@@ -1,5 +1,6 @@
 package edu.uic.cs.jmvx.coordinate;
 
+import edu.uic.cs.jmvx.vectorclock.VectorClock;
 import org.newsclub.net.unix.*;
 
 import java.io.File;
@@ -256,7 +257,7 @@ public class Coordinator {
 
         leaderThreads = new HashMap<>();
         followerThreads = new HashMap<>();
-        AtomicInteger clockIndex = new AtomicInteger(1);
+        AtomicInteger clockIndex = new AtomicInteger(VectorClock.START_INDEX);
 
         Thread leaderAcceptor   = new Thread(() -> {
             while (true) {

@@ -1,11 +1,14 @@
 package edu.uic.cs.jmvx.runtime.strategy;
 
 import edu.uic.cs.jmvx.runtime.*;
+import edu.uic.cs.jmvx.runtime.pools.*;
 import sun.misc.Unsafe;
 import sun.nio.fs.UnixException;
 import sun.nio.fs.UnixFileAttributes;
 import sun.nio.fs.UnixNativeDispatcher;
 import sun.nio.fs.UnixPath;
+
+import java.util.Optional;
 import java.util.TimeZone;
 
 import java.io.*;
@@ -16,6 +19,10 @@ import java.net.URL;
 import java.io.IOException;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 
 public class SingleLeaderWithoutCoordinator implements JMVXStrategy {
 
@@ -424,5 +431,28 @@ public class SingleLeaderWithoutCoordinator implements JMVXStrategy {
     @Override
     public String getSystemTimeZoneID(String javaHome) {
         return TimeZone.getSystemTimeZoneID(javaHome);
+    }
+
+    @Override
+    public void submit(JMVXJob task) {
+
+    }
+    @Override
+    public void runnableFutureDone(JMVXQueueingFuture future){ }
+
+    @Override
+    public ExecutorService newFixedThreadPool(int nThreads, ThreadFactory threadFactory) {
+        return new JMVXThreadPoolExecutor(nThreads, nThreads,
+                0L, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>(),
+                new JMVXThreadFactory(Optional.ofNullable(threadFactory)));
+    }
+
+    @Override
+    public ExecutorService newCachedThreadPool(ThreadFactory threadFactory) {
+        return new JMVXThreadPoolExecutor(0, Integer.MAX_VALUE,
+                60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(),
+                new JMVXThreadFactory(Optional.ofNullable(threadFactory)));
     }
 }

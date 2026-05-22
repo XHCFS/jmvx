@@ -39,7 +39,7 @@ public class VectorClockTest {
             int I = i; //avoiding a compile time error
             leaders[i] = () -> {
                 // Register this thread
-                leaders_clock.registerNewThread(I);
+                int vectorClockIndex = leaders_clock.registerNewThread(I);
 
                 // Wait for all other leaders to be ready
                 waitToBeReady(sync);
@@ -49,7 +49,7 @@ public class VectorClockTest {
                     // Race for the lock
                     synchronized (sync) {
                         // Got the lock, increment the vector clock to say that
-                        leaders_clock.increment(clocks[last.get()]);
+                        leaders_clock.increment(vectorClockIndex, clocks[last.get()]);
                         // Make the change
                         expected[last.getAndIncrement()] = c;
                     }
@@ -70,7 +70,7 @@ public class VectorClockTest {
             int I = i; //avoiding a compile time error
             followers[i] = () -> {
                 // Register this thread
-                followers_clock.registerNewThread(I);
+                int vectorClockIndex = followers_clock.registerNewThread(I);
 
                 // Wait for all other followers to be ready
                 waitToBeReady(sync);
@@ -78,13 +78,13 @@ public class VectorClockTest {
                 // Run the workload
                 for (char c : "Hello world".toCharArray()) {
                     // Wait for our turn
-                    while (!followers_clock.sync(clocks[last.get()]));
+                    while (!followers_clock.sync(vectorClockIndex, clocks[last.get()]));
 
                     synchronized (sync) {
                         // Increment the vector clock AFTER getting the lock
                         // Doing this may release the next thread and must be done AFTER getting the lock
                         // Otherwise another thread may get the lock before we do
-                        followers_clock.increment(null);
+                        followers_clock.increment(vectorClockIndex,null);
                         // Perform the change
                         actual[last.getAndIncrement()] = c;
                     }

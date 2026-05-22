@@ -20,6 +20,12 @@ import java.util.HashSet;
  */
 public class ByteCodeVersionBumpClassVisitor extends ClassVisitor implements Opcodes {
 
+    /* Overkill
+    * The instrumenter makes two passes over each file SEQUENTIALLY.
+    * The first pass may add something to this hash set, and the second pass looks for the ONE THING we added.
+    * This hash set could have been a field.
+    * The set would have been needed if all files were given the first pass,
+    * then all files undergo the second, but that's not the case*/
     public static HashSet<String> classes = new HashSet<>();
 
     private boolean enabled;

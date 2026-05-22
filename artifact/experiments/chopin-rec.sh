@@ -2,7 +2,7 @@
 
 BMS=("avrora" "batik" "fop" "jython" "jme" "pmd" "sunflow" "xalan")
 SKIP=("h2" "luindex" "lusearch")
-COLS=("vanilla" "nosync" "rec" "rep")
+COLS=("vanilla" "vanilla-preserve" "nosync" "rec" "rec-preserve") # "old" - not tested by default
 RESULTS_DIR="results"
 
 if [ "$1" != "all" ]; then
@@ -24,7 +24,7 @@ if [ "$5" != "" ]; then
     THREADS=$5
 fi
 
-DACAPO_ARGS="-t $THREADS -n 1"
+DACAPO_ARGS="-t $THREADS -n 1" 
 TIMEOUT="timeout -k 10 10m"
 TIMEOUTLONG="timeout -k 10 20m"
 TIME=`which time`
@@ -40,7 +40,8 @@ exptemplate() {
     if [[ " ${COLS[*]} " =~ "$MODE" ]]; then
         for B in ${BMS[@]}; do
             LOG="$RESULTS_DIR/$LOGPREFIX-$B.txt"
-            CMD="$TASKSET_LEADER $TIMEOUT $SCRIPT_DIR/$SCRIPT $B $DACAPO_ARGS"
+            SUMMARY="$RESULTS_DIR/summary-$B.txt"
+            CMD="$TASKSET_LEADER $TIME $TIMEOUT $SCRIPT_DIR/$SCRIPT $B $DACAPO_ARGS"
             echo "" > $LOG
             for I in $(seq $N); do
                 echo "Executing $MODE $B run $I"
@@ -51,6 +52,10 @@ exptemplate() {
 		echo "$CMD" |& tee -a $LOG
 		eval "$CMD" |& tee -a $LOG
                 
+                ANALYSIS="scripts/analyzer.sh Summary rec"
+                echo "$ANALYSIS" |& tee -a $SUMMARY
+                eval "$ANALYSIS" |& tee -a $SUMMARY
+
 		#compress everything
 		gzip rec/*.dat
 		ls -lah rec |& tee -a $LOG
@@ -63,6 +68,11 @@ exptemplate() {
 #note, this causes vanilla to make and delete a rec directory
 #but it doesn't matter
 exptemplate "vanilla" "run-vanilla.sh" "vanilla-rec"
-exptemplate "rec" "run-recorder.sh" "jmvx-rec"
+exptemplate "old" "run-recorder.sh" "jmvx-rec-old"
+exptemplate "rec" "run-recorder-pools.sh" "jmvx-rec"
 exptemplate "nosync" "run-recorder-nosync.sh" "jmvx-rec-nosync"
 
+# hacky but effective, modify the global value of DACAPO_ARGS to include the preserve flag needed for this test
+DACAPO_ARGS="$DACAPO_ARGS --preserve" #preserve for compat with hybrid
+exptemplate "vanilla-preserve" "run-vanilla.sh" "vanilla-preserve-rec"
+exptemplate "rec-preserve" "run-recorder-pools.sh" "jmvx-preserve-rec"

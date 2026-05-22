@@ -1,0 +1,47 @@
+#!/usr/bin/perl
+
+use Getopt::Std;
+
+$help = 
+"logseq - Like seq, but on a log scale.
+Useful for parameter sweeps.
+
+Usage: ./logseq [options] -s <start> -b <base> -n <n>
+
+
+Required Flags:
+  -s <start>   Use <start> as the first value 
+  -n <n>       Use <n> number of steps
+  -b <base>    Use <base> as the base
+                 of the exponent in the log scale
+
+Optional Flags:
+  -w           Print numbers in a fixed width
+
+Values printed are s * (b ^ i) where i is an integer
+increasing from 0 to (but excluding) n.
+";
+
+die $help unless getopts('b:hn:s:w');
+die $help if $opt_h;
+
+die $help unless $opt_s;
+die $help unless $opt_n;
+die $help unless $opt_b;
+
+$width = 0;
+
+if($opt_w) {
+  $max = $opt_s * ($opt_b ** ($opt_n - 1));
+  $width = length "$max";
+}
+
+$t = $opt_s;
+for(1..$opt_n){
+    if($width) {
+      printf "%0${width}d\n", $t;
+    } else { 
+      print "$t\n";
+    }
+    $t *= $opt_b;
+}

@@ -9,6 +9,8 @@ import edu.uic.cs.jmvx.runtime.JMVXInputStream;
 import edu.uic.cs.jmvx.runtime.JMVXOutputStream;
 import edu.uic.cs.jmvx.runtime.JMVXRuntime;
 import edu.uic.cs.jmvx.circularbuffer.CircularBuffer;
+import edu.uic.cs.jmvx.runtime.pools.*;
+import edu.uic.cs.jmvx.runtime.util.OptimizedEvent;
 import org.apache.log4j.Logger;
 import org.newsclub.net.unix.AFUNIXSocket;
 import edu.uic.cs.jmvx.Utils;
@@ -16,8 +18,10 @@ import edu.uic.cs.jmvx.Utils;
 import java.lang.reflect.Constructor;
 import java.nio.file.*;
 import java.nio.file.attribute.FileAttribute;
-import java.nio.file.attribute.PosixFileAttributes;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.nio.ByteBuffer;
@@ -50,7 +54,7 @@ public class Follower implements JMVXStrategy {
     private ObjectOutputStream toBufferStream;
 
     //Address of the server socket we use to emulate connections
-    protected static final int junkPort = JMVXRuntime.junkPort;//9999;
+    protected static final int junkPort = JMVXRuntime.parameters.junkPort;
     protected final static InetSocketAddress junkAddress = new InetSocketAddress(InetAddress.getLoopbackAddress(), junkPort);
     protected static ServerSocket junkServer;
     protected boolean connected = false;
@@ -77,14 +81,20 @@ public class Follower implements JMVXStrategy {
 
     // Using the default DivergenceHandler for now, but later can be changed to a user-supplied one
     DivergenceHandler divergenceHandler;
+    protected int vectorClockIndex = -1;
+    /* is the role is attached to a worker thread */
+    protected boolean workerThread = false;
+    /* reference to the running thread or task (if a worker).
+     * Used as a reference to the owner of an object for partial ordering */
+    //protected Runnable taskRef = null;
+
     {
         try {
-            String className = System.getProperty("divergenceHandler", "edu.uic.cs.jmvx.runtime.DacapoDivergenceHandler");
+            String className = JMVXRuntime.parameters.divergenceHandlerClassName;
             Class<?> clazz = null;
             clazz = Class.forName(className);
-            Constructor<?>[] constructors = clazz.getConstructors();
-            Object object = constructors[0].newInstance(new Object[]{});
-            divergenceHandler = (DivergenceHandler)object;
+            Constructor<?> constructor = clazz.getConstructor();
+            divergenceHandler = (DivergenceHandler) constructor.newInstance();
         } catch (Exception e) {
             divergenceHandler = new DacapoDivergenceHandler();
         }
@@ -108,12 +118,13 @@ public class Follower implements JMVXStrategy {
     // have to create a new one every time. We can reuse this one by setting its fields accordingly.
     DivergenceStatus<Object> divergenceStatus = new DivergenceStatus();
 
-    protected static boolean checksumCommunicationEnabled = JMVXRuntime.checksumCommunicationEnabled;
-    protected static boolean consoleLogsEnabled = JMVXRuntime.consoleLogsEnabled;
-    protected static boolean readsFromDisk = JMVXRuntime.readsFromDisk;
-    protected static boolean circularBufferCommunicationEnabled = JMVXRuntime.circularBufferCommunicationEnabled;
-    protected static boolean avoidObjectSerialization = JMVXRuntime.avoidObjectSerialization;
-    protected static boolean useBufferBackedStreams = JMVXRuntime.useBufferBackedStreams;
+    protected static final boolean checksumCommunicationEnabled = JMVXRuntime.parameters.checksumCommunicationEnabled;
+    protected static final boolean consoleLogsEnabled = JMVXRuntime.parameters.consoleLogsEnabled;
+    protected static final boolean readsFromDisk = JMVXRuntime.parameters.readsFromDisk;
+    protected static final boolean circularBufferCommunicationEnabled = JMVXRuntime.parameters.circularBufferCommunicationEnabled;
+    protected static final boolean avoidObjectSerialization = JMVXRuntime.parameters.avoidObjectSerialization;
+    protected static final boolean useBufferBackedStreams = JMVXRuntime.parameters.useBufferBackedStreams;
+    protected static final boolean deleteMmapOnDisk = JMVXRuntime.parameters.deleteMmapOnDisk;
 
 
     public void reConnect(AFUNIXSocket socket, ObjectOutputStream outputStream, ObjectInputStream inputStream, Logger l) {
@@ -228,9 +239,16 @@ public class Follower implements JMVXStrategy {
             maybeWrite(os, metadata.buffer);
         }else{
             maybeWrite(os, expectedB);
-	}
+        }
     }
 
+    /*
+    Rewrite to handle better?
+    This is comparing parts of 2 different byte buffers,
+    but the portion of the buffer we receive should only be the pertinent part.
+    In other words, we need to the offsets and lengths match,
+    but the offset should be 0 for received bytes regardless.
+     */
     protected void verifyWriteOb(JMVXOutputStream os, byte[] expectedBytes, byte[] recievedBytes, int expectedOff,
                                int recievedOff, int expectedLen, int recievedLen, Object write) throws IOException {
         boolean bytesAreEqual;
@@ -286,7 +304,15 @@ public class Follower implements JMVXStrategy {
             maybeWrite(os, metadata.buffer, metadata.offset, metadata.length);
         }else{
             maybeWrite(os, expectedBytes, expectedOff, expectedLen);
-	}
+        }
+    }
+
+    public static InputStream maybeBufferedInputStream(InputStream toDecorate){
+        return useBufferBackedStreams ? new BufferedInputStream(toDecorate) : toDecorate;
+    }
+
+    public static OutputStream maybeBufferedOutputStream(OutputStream toDecorate){
+        return useBufferBackedStreams ? new BufferedOutputStream(toDecorate) : toDecorate;
     }
 
     @Override
@@ -307,7 +333,7 @@ public class Follower implements JMVXStrategy {
                 String status = (String) fromCoordinator.readObject();
                 if (status.equals("BufferInitialized")) {
                     buffer = JMVXRuntime.mmapFile(false);
-                    if (JMVXRuntime.deleteMmapOnDisk)
+                    if (deleteMmapOnDisk)
                         buffer.deleteFileOnDisk();
 //                    toCoordinator.writeObject("FollowerReady");
 //                    toCoordinator.flush();
@@ -321,44 +347,42 @@ public class Follower implements JMVXStrategy {
                 throw new Error(e);
             }
 
-            if(useBufferBackedStreams) {
-                CircularBufferInputStream bufferInputStream = new CircularBufferInputStream(buffer);
+            CircularBufferInputStream bufferInputStream = new CircularBufferInputStream(buffer);
+            try {
+                fromBufferStream = new ObjectInputStream(maybeBufferedInputStream(bufferInputStream));
+            } catch (IOException e) {
+                throw new Error(e);
+            }
+            fromSocketStream = fromCoordinator;
+            fromCoordinator = fromBufferStream;
+            toSocketStream = toCoordinator;
+            {
+                OutputStream ops;
+                AtomicBoolean flag = new AtomicBoolean(false);
                 try {
-                    fromBufferStream = new ObjectInputStream(new BufferedInputStream(bufferInputStream));
+                    ops = new OutputStream() {
+                        @Override
+                        public void write(int b) throws IOException {
+                            if (flag.get()) {
+                                throw new IOException("The follower cannot write to the ringbuffer");
+                            }
+                        }
+                    };
+                    this.toCoordinator = new ObjectOutputStream(ops);
+                    toBufferStream = toCoordinator;
                 } catch (IOException e) {
                     throw new Error(e);
                 }
-                fromSocketStream = fromCoordinator;
-                fromCoordinator = fromBufferStream;
-                toSocketStream = toCoordinator;
-                {
-                    OutputStream ops;
-                    AtomicBoolean flag = new AtomicBoolean(false);
-                    try {
-                        ops = new OutputStream() {
-                            @Override
-                            public void write(int b) throws IOException {
-                                if (flag.get()) {
-                                    throw new IOException("The follower cannot write to the ringbuffer");
-                                }
-                            }
-                        };
-                        this.toCoordinator = new ObjectOutputStream(ops);
-                        toBufferStream = toCoordinator;
-                    } catch (IOException e) {
-                        throw new Error(e);
-                    }
-                    flag.set(true);
-                }
+                flag.set(true);
             }
-            else {
-                fromSocketStream = fromCoordinator;
-                fromBufferStream = fromCoordinator;
-                toSocketStream = toCoordinator;
-                toBufferStream = toCoordinator;
-            }
-
+        } else {
+            fromSocketStream = fromCoordinator;
+            fromBufferStream = fromCoordinator;
+            toSocketStream = toCoordinator;
+            toBufferStream = toCoordinator;
         }
+        workerThread = Thread.currentThread() instanceof JMVXThreadFactory.JMVXPoolThread;
+        //taskRef = Thread.currentThread();
     }
 
     private static Object clinit = new Object();
@@ -432,6 +456,8 @@ public class Follower implements JMVXStrategy {
     public void connect(int port) {
         if (!connected) {
             Boolean coordinatorReady;
+            /*TODO refactor to unify with Replayer's field for clockIndex
+             * This will help with porting Thread Pool support later */
             int clockIndex;
             while (true) {
                 try {
@@ -441,12 +467,12 @@ public class Follower implements JMVXStrategy {
                     followerSocket = AFUNIXSocket.newInstance();
                     followerSocket.setAncillaryReceiveBufferSize(1024);
                     followerSocket.connect(Coordinator.FOLLOWER_COMMS_ADDR);
-                    toCoordinator = new ObjectOutputStream(followerSocket.getOutputStream());
+                    toCoordinator = new ObjectOutputStream(maybeBufferedOutputStream(followerSocket.getOutputStream()));
 
                     toCoordinator.writeObject(Thread.currentThread().getName());
                     toCoordinator.flush();
 
-                    fromCoordinator = new ObjectInputStream(followerSocket.getInputStream());
+                    fromCoordinator = new ObjectInputStream(maybeBufferedInputStream(followerSocket.getInputStream()));
                     clockIndex = fromCoordinator.readInt();
 
                     sendMode();
@@ -469,7 +495,7 @@ public class Follower implements JMVXStrategy {
                     }
                 }
             }
-            JMVXRuntime.clock.registerNewThread(clockIndex);
+            vectorClockIndex = JMVXRuntime.clock.registerNewThread(clockIndex);
             connected = true;
 
             synchronized (connections){
@@ -537,15 +563,15 @@ public class Follower implements JMVXStrategy {
         try {
             objectCounter++;
             return fromCoordinator.readObject();
-        }catch (ClassNotFoundException | IOException e){
-            //an error with JMVX
-            //OR the end of a recording's log
-            //e.printStackTrace();
+        }catch (EOFException e){
             return null;
+        }catch (ClassNotFoundException | IOException e){
+            //likely an OptionalDataException, which means the next read is primitive data, not an object!
+            throw new DivergenceError(e);
         }
     }
 
-    private Object receiveObjectOverSocket(){
+    protected Object receiveObjectOverSocket(){
         try {
             objectCounter++;
             return fromSocketStream.readObject();
@@ -703,7 +729,7 @@ public class Follower implements JMVXStrategy {
     public int available(JMVXInputStream is) throws IOException{
         int ret = 0;
         Object read = receiveObjectFromCoordinator();
-        if (JMVXRuntime.avoidObjectSerialization && read instanceof byte[]) {
+        if (avoidObjectSerialization && read instanceof byte[]) {
             byte[] bb = (byte[]) read;
             return  ((bb[0] & 0xFF) << 24) |
                     ((bb[1] & 0xFF) << 16) |
@@ -790,43 +816,13 @@ public class Follower implements JMVXStrategy {
 
     // divergenceOrSwitchRoles
 
-    public enum DivergenceSource { NONE, FROM_READ, FROM_WRITE };
-
-    public static class Metadata {
-        public byte[] buffer;
-        public int offset;
-        public int length;
-        public boolean isOffsetPresent;
-
-        // from represents which kind of method this metadata is coming from
-        // There are 3 cases: 1) a read, 2) a write or 3) anything else
-        public DivergenceSource source;
-
-        // original buffer is the buffer that is coming from the leader
-        // Similarly for originalOffset and originalLength
-        public byte[] originalBuffer;
-        public int originalOffset;
-        public int originalLength;
-
-        public JMVXInputStream is;
-
-        Metadata() {}
-        Metadata(byte[] buffer, int length, int offset) {
-            this.buffer = buffer;
-            this.length = length;
-            this.offset = offset;
-        }
-        Metadata(byte[] buffer, int length, int offset, DivergenceSource source) {
-            this(buffer, length, offset);
-            this.source = source;
-        }
-    }
+    ;
 
     protected DivergenceStatus<Object> divergence(String expectedClassName, String actualClassName, Object message, Callable<Object> function) {
         return divergence(expectedClassName, actualClassName, message, function, null);
     }
 
-    private DivergenceStatus<Object> divergence(String expectedClassName, String actualClassName, Object message, Callable<Object> function, Metadata metadata) {
+    protected DivergenceStatus<Object> divergence(String expectedClassName, String actualClassName, Object message, Callable<Object> function, Metadata metadata) {
         divergenceStatus.hasDivergenceOccured = true; // explicity setting this field to true here
         // we assume beforehand that things are not going to go well
 
@@ -835,7 +831,7 @@ public class Follower implements JMVXStrategy {
             // set this to something larger than 1 to avoid entering the promote/demote strategy again.
             Leader.one.set(20);
             strategy.reConnect(followerSocket, toCoordinator, fromCoordinator, log);
-            JMVXRuntime.setStrategy(new ReentrantStrategy(strategy));
+            JMVXRuntime.setStrategy(ReentrantStrategy.singleLeaderPassthrough(strategy));
             JMVXRuntime.openExistingFiles();
 
             try { // case 1
@@ -1908,36 +1904,51 @@ public class Follower implements JMVXStrategy {
 //            return;
 //        }
 
-        Object me;
+        Object read = null;
+        byte tagByte = -1;
+        long[] clockCopy = null;
         if(circularBufferCommunicationEnabled) {
             if(avoidObjectSerialization) {
-                byte[] clockCopyBytes = buffer.readData(true);
-                long[] clockCopy = new long[(clockCopyBytes.length)/Long.BYTES];
+                byte[] bufferBytes = buffer.readData(true);
+                tagByte = bufferBytes[0];
+                clockCopy = new long[(bufferBytes.length - OptimizedEvent.TAG_SIZE)/Long.BYTES];
 
-                JMVXRuntime.unsafe.copyMemory(clockCopyBytes, Unsafe.ARRAY_BYTE_BASE_OFFSET,
+                JMVXRuntime.unsafe.copyMemory(bufferBytes, Unsafe.ARRAY_BYTE_BASE_OFFSET + OptimizedEvent.TAG_SIZE,
                         clockCopy, Unsafe.ARRAY_LONG_BASE_OFFSET,
-                        clockCopyBytes.length);
-                JMVXRuntime.clock.sync(clockCopy, true);
-                JMVXRuntime.unsafe.monitorEnter(o);
-                JMVXRuntime.clock.increment(null);
-                return;
+                        bufferBytes.length);
+            }else {
+                read = readFromBuffer();
             }
-            me = readFromBuffer();
-        }
-        else {
-            me = receiveObjectFromCoordinator();
-        }
-
-        if (me instanceof Leader.MonitorEnter) {
-            Leader.MonitorEnter monEnter = (Leader.MonitorEnter) me;
-            
-            JMVXRuntime.clock.sync(monEnter.clock, true);
-
-            JMVXRuntime.unsafe.monitorEnter(o);
-            JMVXRuntime.clock.increment(null);
         } else {
-            divergence(Leader.MonitorEnter.class.getSimpleName(), me.getClass().getSimpleName());
+            read = receiveObjectFromCoordinator();
         }
+
+        if(read != null) {
+            if (read instanceof Leader.MonitorEnter) {
+                Leader.MonitorEnter me = (Leader.MonitorEnter) read;
+                tagByte = me.tagByte;
+                clockCopy = me.clock;
+            } else {
+                divergence(Leader.MonitorEnter.class.getSimpleName(), read.getClass().getSimpleName());
+            }
+        }
+
+        OptimizedEvent tag = OptimizedEvent.fromByte(tagByte);
+        switch (tag){
+            case SINGLE_THREADED: //avoid vc
+                JMVXRuntime.unsafe.monitorEnter(o);
+                return;
+            case MONITOR_ENTER: //have to sync
+                JMVXRuntime.clock.sync(vectorClockIndex, clockCopy, true);
+                //fall through to grab lock and increment
+            case FAST_MONITOR_ENTER: //avoid sync, but update vc
+                JMVXRuntime.unsafe.monitorEnter(o);
+                JMVXRuntime.clock.increment(vectorClockIndex, null);
+                break;
+            default: //divergence, only happens if we screw up somewhere
+                throw new DivergenceError();
+        }
+
     }
 
     @Override
@@ -1956,52 +1967,70 @@ public class Follower implements JMVXStrategy {
             JMVXRuntime.unsafe.monitorExit(o);
         }
 
-        Object w;
+        Object w = null;
+        byte tagByte = -1;
+        long[] clockCopy = null;
         if(circularBufferCommunicationEnabled) {
             if (avoidObjectSerialization) {
-                byte[] clockCopyBytes = buffer.readData(true);
-                long[] clockCopy = new long[(clockCopyBytes.length) / Long.BYTES];
+                byte[] bufferBytes = buffer.readData(true);
+                tagByte = bufferBytes[0];
+                clockCopy = new long[(bufferBytes.length - OptimizedEvent.TAG_SIZE) / Long.BYTES];
 
-                JMVXRuntime.unsafe.copyMemory(clockCopyBytes, Unsafe.ARRAY_BYTE_BASE_OFFSET,
+                JMVXRuntime.unsafe.copyMemory(bufferBytes, Unsafe.ARRAY_BYTE_BASE_OFFSET + OptimizedEvent.TAG_SIZE,
                         clockCopy, Unsafe.ARRAY_LONG_BASE_OFFSET,
-                        clockCopyBytes.length);
-                JMVXRuntime.clock.sync(clockCopy, true);
+                        bufferBytes.length);
+                /*JMVXRuntime.clock.sync(vectorClockIndex, clockCopy, true);
                 while (i != 0) {
                     JMVXRuntime.unsafe.monitorEnter(o);
                     i -= 1;
                 }
-                JMVXRuntime.clock.increment(null);
-                return;
+                JMVXRuntime.clock.increment(vectorClockIndex,null);
+                return;*/
+            }else {
+                w = readFromBuffer();
             }
-            w = readFromBuffer();
         }else{
             w = receiveObjectFromCoordinator();
         }
 
-        if (w instanceof Leader.Wait) {
-            Leader.Wait wait = (Leader.Wait) w;
+        if (w != null) {
+            if(w instanceof Leader.Wait) {
+                Leader.Wait wait = (Leader.Wait) w;
+                tagByte = wait.tagByte;
+                clockCopy = wait.clock;
+            } else {
+                Callable<Object> function = () -> {
+                    JMVXRuntime.wait((Object) o, timeout, nanos);
+                    return null;
+                };
 
-            // Wait for our turn to get the lock
-            JMVXRuntime.clock.sync(wait.clock, true);
+                DivergenceStatus<Object> divergenceStatus = divergence(Leader.Wait.class.getSimpleName(), w.getClass().getSimpleName(), w, function);
 
-            // Get the lock
-            while (i != 0) {
-                JMVXRuntime.unsafe.monitorEnter(o);
-                i -= 1;
+                if (divergenceStatus.containsException) {
+                    throw (InterruptedException) divergenceStatus.returnValue;
+                }
             }
+        }
 
-            JMVXRuntime.clock.increment(null);
-        } else {
-            Callable<Object> function = () -> {
-                JMVXRuntime.wait((Object) o, timeout, nanos);
-                return null;
-            };
-
-            DivergenceStatus<Object> divergenceStatus = divergence(Leader.Wait.class.getSimpleName(), w.getClass().getSimpleName(), w, function);
-
-            if (divergenceStatus.containsException) {
-                throw (InterruptedException) divergenceStatus.returnValue;
-            }
+        OptimizedEvent tag = OptimizedEvent.fromByte(tagByte);
+        // Wait for our turn to get the lock
+        switch (tag) {
+            case SINGLE_THREADED: //avoid vc
+                // Get the lock
+                for(; i != 0; i--)
+                    JMVXRuntime.unsafe.monitorEnter(o);
+                return;
+            case WAIT: //have to sync
+                JMVXRuntime.clock.sync(vectorClockIndex, clockCopy, true);
+                //fall through to grab lock and increment
+            case FAST_WAIT: //avoid sync, but update vc
+                // Get the lock
+                for(; i != 0; i--)
+                    JMVXRuntime.unsafe.monitorEnter(o);
+                JMVXRuntime.clock.increment(vectorClockIndex, null);
+                break;
+            default: //divergence
+                throw new DivergenceError();
         }
     }
 
@@ -2430,7 +2459,7 @@ public class Follower implements JMVXStrategy {
 
     @Override
     public long currentTimeMillis() {
-        if (JMVXRuntime.avoidObjectSerialization && JMVXRuntime.circularBufferCommunicationEnabled) {
+        if (avoidObjectSerialization && circularBufferCommunicationEnabled) {
             byte[] b = new byte[8];
             this.buffer.readData(b, 0, b.length);
             long ret = ((long) b[7] << 56)
@@ -2511,12 +2540,11 @@ public class Follower implements JMVXStrategy {
     @Override
     public int open(UnixPath path, int flags, int mode) throws UnixException {
         Object read = receiveObjectFromCoordinator();
-        int stub;
         if(read instanceof Leader.NativeOpen){
             Leader.NativeOpen open = (Leader.NativeOpen) read;
             if(!open.path.equals(path.toString()))
-                stub = 0;
-            return UnixNativeDispatcher.open(UnixPath.toUnixPath(Paths.get("/dev/null")), flags, mode);
+                throw new DivergenceError();
+            return UnixNativeDispatcher.open(path, flags, mode);
         }else if (read instanceof UnixException){
             throw (UnixException) read;
         }else{
@@ -2803,6 +2831,62 @@ public class Follower implements JMVXStrategy {
             Callable<Object> function = () -> { return TimeZone.getSystemTimeZoneID(javaHome); };
             DivergenceStatus<Object> divergenceStatus = divergence(Leader.GetSystemTimeZoneID.class.getSimpleName(), read.getClass().getSimpleName(), read, function);
             return (String) divergenceStatus.returnValue;
+        }
+    }
+
+    @Override
+    public ExecutorService newFixedThreadPool(int nThreads, ThreadFactory threadFactory) {
+        JMVXThreadPoolExecutor pool = new MVXSafeExecutor(nThreads, nThreads,
+                0L, TimeUnit.MILLISECONDS,
+                new JMVXThreadFactory(Optional.ofNullable(threadFactory)));
+        return pool;
+    }
+
+    @Override
+    public ExecutorService newCachedThreadPool(ThreadFactory threadFactory) {
+        JMVXThreadPoolExecutor pool = new MVXSafeExecutor(0, Integer.MAX_VALUE,
+                0L, TimeUnit.MILLISECONDS, //no timeout, kill a worker manually if we run out of jobs
+                new JMVXThreadFactory(Optional.ofNullable(threadFactory)));
+        return pool;
+    }
+
+    @Override
+    public void beforeExecute(Thread t, JMVXJob r) {
+        //follower blocks here..., we need to write something when the worker quits
+        Object read = receiveObjectFromCoordinator();
+        if(read instanceof Leader.JobStarted){
+            Leader.JobStarted jobInfo = (Leader.JobStarted) read;
+            r.$JMVX$setClock(jobInfo.stamp);
+            MVXSafeExecutor exec = (MVXSafeExecutor) r.getPool();
+            JMVXJob realJob = exec.takeJobWithStamp(jobInfo.stamp);
+            r.setJob(realJob);
+        }else if(read.equals(CoordinatorThread.exitMessage)) {
+            throw new RuntimeException("Leader worker ended, killing follower worker");
+        }else{
+            throw new DivergenceError();
+        }
+    }
+
+    @Override
+    public void afterExecute(JMVXJob r, Throwable t) { }
+
+    @Override
+    public void submit(JMVXJob task) {
+        Object read = receiveObjectFromCoordinator();
+        if(read instanceof RecorderWithPools.JobCreated) {
+            task.$JMVX$setClock(((RecorderWithPools.JobCreated)read).id);
+        }else{
+            throw new DivergenceError();
+        }
+    }
+
+    @Override
+    public void runnableFutureDone(JMVXQueueingFuture future) {
+        Object read = receiveObjectFromCoordinator();
+        if(read instanceof RecorderWithPools.TaskFinished){
+            future.$JMVX$setClock(((RecorderWithPools.TaskFinished)read).stamp);
+        }else{
+            throw new DivergenceError();
         }
     }
 }

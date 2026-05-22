@@ -7,7 +7,7 @@ public class BigLockReentrantStrategy extends ReentrantStrategy {
     private final Lock lock = new ReentrantLock();
 
     public BigLockReentrantStrategy(JMVXStrategy strategy) {
-        super(strategy);
+        super(strategy, new SingleLeaderWithoutCoordinator());
     }
 
     @Override
