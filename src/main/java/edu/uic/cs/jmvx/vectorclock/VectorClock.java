@@ -1,28 +1,32 @@
 package edu.uic.cs.jmvx.vectorclock;
 
-import com.sun.org.apache.xpath.internal.operations.Bool;
-
-import java.util.*;
 import java.util.stream.LongStream;
 import java.util.Arrays;
-import java.util.Comparator;
 
 public class VectorClock {
 
-    private Map<Long, Integer> tidToIndex = new HashMap<>();
     protected long[] clock = {0L};//new long[1]; //clinit slot is index 0
+    public static final int START_INDEX = 1; //the index to start registering threads at
     private volatile long inClinit = -1L; //which thread is redirected to clinit slot
 
-    protected int getIdX(){
+    /**
+     * Returns either idx or 0 based on if the thread is currently in a static initializer (inClinit)
+     * @param idx slot to use
+     * @return idx or 0 (0 is the static initializer slot)
+     */
+    protected int confirmIndex(int idx){
         long tid = Thread.currentThread().getId();
         if(inClinit == tid){
             return 0;
         }
-        synchronized (this) {
-            return tidToIndex.get(tid);
-        }
+        return idx;
     }
 
+    /**
+     * Set if a thread is in a static initializer
+     * Implicitly sync'ed because only 1 thread can run a static initializer at a time
+     * @param val boolean if the thread is (or is not) in a static initializer
+     */
     public void setInClinit(boolean val){
         long tid = Thread.currentThread().getId();
         if(val){
@@ -40,16 +44,39 @@ public class VectorClock {
         return clock.length;
     }
 
+    /**
+     * Registers a new thread to the vector clock by concat'ing one slot
+     * @return
+     */
+    public synchronized int registerNewThread(){
+        //concat 1 to the clock
+        return registerNewThread(this.clock.length);
+    }
+
+    /**
+     * [Potentially] Expand the clock to support a slot at index idx
+     * @param idx
+     * @return
+     */
     public synchronized int registerNewThread(int idx) {
-        long tid = Thread.currentThread().getId();
-
-        //int idx = tidToIndex.size();
-
-        tidToIndex.put(tid, idx);
-
-        //if we get an index that is larger than tidToIndex.size()+1,
+        /*
+        May want a fast path to determine if to update the VC for ReplayerWithPools
+        in order to handle scaling thread pools
+        Eg
+        public int registerNewThread(int idx) {
+          if(idx < this.clock.length)
+            return idx
+          else{
+             synchronized(this){
+               //increase size of clock (current method logic)
+               //including checking idx against the size of the clock again
+             }
+          }
+        }
+         */
+        //if we get an index that is larger than clock.length+1,
         //we will need to add arbitrarily many longs
-        int min_length = idx + 1; //minumum length of the clock to manage threads 0 to idx
+        int min_length = idx + 1; //minimum length of the clock to manage threads 0 to idx
         if(min_length > this.clock.length) {
             long[] toConcat = new long[min_length - this.clock.length];
             Arrays.fill(toConcat, 0);
@@ -58,9 +85,15 @@ public class VectorClock {
         return idx;
     }
 
-    public synchronized long[] increment(long[] result) {
-        long tid = Thread.currentThread().getId();
-        int idx = getIdX(); //tidToIndex.get(tid);
+    /**
+     * Return a slot to the clock for rebinding/reuse
+     * Does nothing here as this clock strategy always concats a new, unique slot
+     * @param idx
+     */
+    public synchronized void unregisterThread(int idx){ }
+
+    public synchronized long[] increment(int idx, long[] result) {
+        idx = confirmIndex(idx);
 
         long val = clock[idx] + 1;
         clock[idx] = val;
@@ -75,20 +108,12 @@ public class VectorClock {
         return result;
     }
 
-    public boolean sync(long[] clock) {
-        return sync(clock, false);
+    public boolean sync(int idx, long[] clock) {
+        return sync(idx, clock, false);
     }
 
-    public boolean sync(long[] clock, boolean keepTrying) {
-        long tid = Thread.currentThread().getId();
-
-        int idx = getIdX(); //sync method
-
-        //TODO register the clock we are sync'ing to so we can implement a function to see which thread should go next
-
-        /*synchronized (this) {
-            idx = tidToIndex.get(tid);
-        }*/
+    public boolean sync(int idx, long[] clock, boolean keepTrying) {
+        idx = confirmIndex(idx);
 
         boolean yield = false;
 
@@ -115,7 +140,8 @@ public class VectorClock {
                             }else
                                 return false;
                         }
-                    } else if (this.clock[i] != clock[i]) {
+                    } else if (this.clock[i] < clock[i]) {
+                        /* Partially ordered events may run ahead. */
                         if (keepTrying) {
                             yield = true;
                             continue tryagain;
@@ -131,10 +157,10 @@ public class VectorClock {
 
 
     public long[] diffClock(long[] clock){
-	    long[] res = new long[this.clock.length];
-	    for(int i = 0; i < this.clock.length; i++){
-		    res[i] = clock[i] - this.clock[i];
-	    }
-	    return res;
+        long[] res = new long[this.clock.length];
+        for(int i = 0; i < this.clock.length; i++){
+            res[i] = clock[i] - this.clock[i];
+        }
+        return res;
     }
 }

@@ -68,98 +68,111 @@ public class Instrumenter implements Opcodes {
 
     static{
         /**
-	 * See inidividual methods for notes on what classes they
-	 * deny and why
-         */
+         * * See inidividual methods for notes on what classes they
+         * deny and why
+         * */
         denyPMDBenchmarkClasses();
-	denyCaches();
-	denyWeakCoupling();
-	denyJVMThreadClasses();
+        denyCaches();
+        denyWeakCoupling();
+        denyJVMThreadClasses();
+        denyMicroBenchHarness();
+        denyIODecorators();
+    }
+
+    private static void denyIODecorators(){
+        /* Denies classes identified to be decorators around other streams
+         * RewindableInputStream is accidentally hit by the InputStreamClassVisitor, but it is just a decorator
+         * Dacapo's Benchmark harness uses ChannelInputStream to wrap a FileChannelImpl when reading MD5 hash files
+         * ChannelInputStream may not be safe to always leave in the deny list.
+         */
+        DENY_LIST.add("org/apache/xerces/impl/XMLEntityManager$RewindableInputStream");
+        DENY_LIST.add("com/sun/org/apache/xerces/internal/impl/XMLEntityManager$RewindableInputStream");
+        DENY_LIST.add("sun/nio/ch/ChannelInputStream");
     }
 
     private static void denyJVMThreadClasses(){
-	/*
-	 * Denies instrumenting Finalizers, Reference handles, and shutdown hooks
-	 * We don't interfere with resource management at this level.
-	 */	    
-	DENY_LIST.add("java/lang/ref/Reference$ReferenceHandler");
-	DENY_LIST.add("java/lang/ref/Finalizer$FinalizerThread");
-	DENY_LIST.add("java/lang/ApplicationShutdownHooks$1");
+        /*
+         * Denies instrumenting Finalizers, Reference handles, and shutdown hooks
+         * We don't interfere with resource management at this level.
+         */
+        DENY_LIST.add("java/lang/ref/Reference$ReferenceHandler");
+        DENY_LIST.add("java/lang/ref/Finalizer$FinalizerThread");
+        DENY_LIST.add("java/lang/ApplicationShutdownHooks$1");
     }
 
     private static void denyWeakCoupling(){
-    	/*these classes have methods whose function is relient on weak memory
-    	or have methods that are called varying number of times throughout the benchmark
-	called a variable number of times.
-	
-	org/sunflow/core/Geometry - 
-	the synchronized methods are initializers. The <i>intersect<\i> method
-	uses double check locking. This class will always run in an arbitrary
-	order, but the order doesn't really matter, because the methods are
-	initializers.  <b>Sunflow will typically deadlock if this class is
-	instrumented</b> 
-	
-	org/sunflow/system/UI - 
-	called inside methods that use double check lock, e.g.,
-	org.sunflow.core.Geometry which is also denied here.  Therefore, the
-	number of times this method is called is unpredictable.  Luckily, this
-	class doesn't actually do anything in the benchmark--by default, the UI
-	is turned off nor does it print anything to the command line. Tracking
-	the monitor for this class just adds overhead.  
+        /*these classes have methods whose function is relient on weak memory
+        or have methods that are called varying number of times throughout the benchmark
+        called a variable number of times.
 
-        org/sunflow/system/Timer - 
-	Methods (generate System.nanoTime events) called inside a block
-	"guarded" by a double check lock, so the thread that executes the call
-	is unpredictable.
+        org/sunflow/core/Geometry -
+        the synchronized methods are initializers. The <i>intersect<\i> method
+        uses double check locking. This class will always run in an arbitrary
+        order, but the order doesn't really matter, because the methods are
+        initializers.  <b>Sunflow will typically deadlock if this class is
+        instrumented</b>
 
-	org/apache/xml/dtm/ref/DTMManagerDefault -
-	IteratorPool and ObjectPool
-	Coupled to weak memory...? This was added to a deny list without a note
-	Coming back to it, Xalan doesn't work without it being denied.
-	There are various double checked locks used in Xalan, maybe there is one here
+        org/sunflow/system/UI -
+        called inside methods that use double check lock, e.g.,
+        org.sunflow.core.Geometry which is also denied here.  Therefore, the
+        number of times this method is called is unpredictable.  Luckily, this
+        class doesn't actually do anything in the benchmark--by default, the UI
+        is turned off nor does it print anything to the command line. Tracking
+        the monitor for this class just adds overhead.
+
+            org/sunflow/system/Timer -
+        Methods (generate System.nanoTime events) called inside a block
+        "guarded" by a double check lock, so the thread that executes the call
+        is unpredictable.
+
+        org/apache/xml/dtm/ref/DTMManagerDefault -
+        IteratorPool and ObjectPool
+        Coupled to weak memory...? This was added to a deny list without a note
+        Coming back to it, Xalan doesn't work without it being denied.
+        There are various double checked locks used in Xalan, maybe there is one here
 
 
-	org/h2/message/TraceSystem - 
-	Has a member that is an LRU cache that interacts with this classes
-	monitor. Thus, this class can affect the vector clock
-	
-	org/h2/util/MemoryUtils - 
-	This is a garbage collector implemented inside of java
-	volatile memory working with locks.
-	* */
-	DENY_LIST.add("org/sunflow/core/Geometry");
-	DENY_LIST.add("org/sunflow/system/UI");
-	DENY_LIST.add("org/sunflow/system/Timer");
-	DENY_LIST.add("org/apache/xml/dtm/ref/DTMManagerDefault");
-	DENY_LIST.add("org/apache/xpath/axes/IteratorPool");
-	DENY_LIST.add("org/apache/xml/utils/ObjectPool");
-	//DENY_LIST.add("org/h2/message/TraceSystem");
-	//DENY_LIST.add("org/h2/util/MemoryUtils");
+        org/h2/message/TraceSystem -
+        Has a member that is an LRU cache that interacts with this classes
+        monitor. Thus, this class can affect the vector clock
+
+        org/h2/util/MemoryUtils -
+        This is a garbage collector implemented inside of java
+        volatile memory working with locks.
+        * */
+        DENY_LIST.add("org/sunflow/core/Geometry");
+        DENY_LIST.add("org/sunflow/system/UI");
+        DENY_LIST.add("org/sunflow/system/Timer");
+        DENY_LIST.add("org/apache/xml/dtm/ref/DTMManagerDefault");
+        DENY_LIST.add("org/apache/xpath/axes/IteratorPool");
+        DENY_LIST.add("org/apache/xml/utils/ObjectPool");
+        //DENY_LIST.add("org/h2/message/TraceSystem");
+        //DENY_LIST.add("org/h2/util/MemoryUtils");
     }
 
 
     private static void denyCaches(){
-	/*
-	*Reasons for skipping classes:
-	org/python/core/PyType and org/python/core/PyJavaType - 
-	put and get data from a CustomConcurrentHashMap that uses weak entries
-	which can be GC'ed at anytime. If the JVM's differ on GC, then the
-	programs diverge because these methods will take different routes and
-	generate different sequences of monitorenter/exit's.
-	
-	org/apache/fop/fo/properties/PropertyCache - 
-	cache that uses a mix of weak memory and locks the weak mem affects how
-	many times a lock is grabbed and creates benign divergences
-	*/
-	DENY_LIST.add("org/python/core/PyType");
-	DENY_LIST.add("org/python/core/PyJavaType");
-    	DENY_LIST.add("org/apache/fop/fo/properties/PropertyCache");
+        /*
+        *Reasons for skipping classes:
+        org/python/core/PyType and org/python/core/PyJavaType -
+        put and get data from a CustomConcurrentHashMap that uses weak entries
+        which can be GC'ed at anytime. If the JVM's differ on GC, then the
+        programs diverge because these methods will take different routes and
+        generate different sequences of monitorenter/exit's.
+
+        org/apache/fop/fo/properties/PropertyCache -
+        cache that uses a mix of weak memory and locks the weak mem affects how
+        many times a lock is grabbed and creates benign divergences
+        */
+        DENY_LIST.add("org/python/core/PyType");
+        DENY_LIST.add("org/python/core/PyJavaType");
+        DENY_LIST.add("org/apache/fop/fo/properties/PropertyCache");
     }
     private static void denyPMDBenchmarkClasses(){
-    	/* pmd does bytecode analysis on itself, particularly on these classes
-	 * Instrumenting them actively changes the performance of the benchmark
-	 * Skip instrumenting them so we have comparable performance to vanilla
-     	*/ 
+        /* pmd does bytecode analysis on itself, particularly on these classes
+        * Instrumenting them actively changes the performance of the benchmark
+        * Skip instrumenting them so we have comparable performance to vanilla
+        */
         DENY_LIST.add("net/sourceforge/pmd/ast/ASTMethodDeclaration");
         DENY_LIST.add("net/sourceforge/pmd/ast/JavaParser");
         DENY_LIST.add("net/sourceforge/pmd/ast/JavaParserTokenManager");
@@ -191,6 +204,14 @@ public class Instrumenter implements Opcodes {
         DENY_LIST.add("net/sourceforge/pmd/dcd/DCD");
     }
 
+    private static void denyMicroBenchHarness(){
+        /*
+        Deny the classes that compute timing data for the microbench.
+         */
+        DENY_LIST.add("microbench/StopWatch");
+        DENY_LIST.add("microbench/StopWatchNanos");
+    }
+
     private static void finishedPass() {
         switch (pass_number) {
             case PASS_ANALYZE:
@@ -200,7 +221,7 @@ public class Instrumenter implements Opcodes {
         }
     }
 
-	public static PreMain.JMVXTransformer transformer = new PreMain.JMVXTransformer();
+    public static PreMain.JMVXTransformer transformer = new PreMain.JMVXTransformer();
 
     private ClassNode cn;
 
@@ -211,24 +232,24 @@ public class Instrumenter implements Opcodes {
 
     private byte[] instrumentClass(InputStream is, ClassLoader cl) {
         try {
-			ClassReader cr = new ClassReader(is);
-			ClassWriter cw = new ClassWriter(cr, 0);
-			cr.accept(cw, 0);
-			byte[] b = cw.toByteArray();
-			lastInstrumentedClass = cr.getClassName();
-			if(DENY_LIST.contains(lastInstrumentedClass)){
-				return b;
-			}
-			b =  transformer.transform(cl, null, null, null, b);
-			if(b==null)
-			{
-				System.err.println("on " + lastInstrumentedClass);
+            ClassReader cr = new ClassReader(is);
+            ClassWriter cw = new ClassWriter(cr, 0);
+            cr.accept(cw, 0);
+            byte[] b = cw.toByteArray();
+            lastInstrumentedClass = cr.getClassName();
+            if(DENY_LIST.contains(lastInstrumentedClass)){
+                return b;
+            }
+            b =  transformer.transform(cl, null, null, null, b);
+            if(b==null)
+            {
+                System.err.println("on " + lastInstrumentedClass);
                 System.err.println("skipping");
-//				System.exit(-1);
-			}
+//              System.exit(-1);
+            }
 
-			return b;
-        } catch (Exception ex) {
+            return b;
+        } catch (Error | Exception ex) {
             logger.error("Exception processing class: " + lastInstrumentedClass, ex);
             return null;
         } finally {

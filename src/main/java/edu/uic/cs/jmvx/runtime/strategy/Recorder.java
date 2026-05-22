@@ -1,7 +1,10 @@
 package edu.uic.cs.jmvx.runtime.strategy;
 
+import edu.uic.cs.jmvx.Utils;
 import edu.uic.cs.jmvx.circularbuffer.CircularBuffer;
 import edu.uic.cs.jmvx.runtime.*;
+import edu.uic.cs.jmvx.runtime.util.OptimizedEvent;
+import edu.uic.cs.jmvx.runtime.util.recording.ReadRecorderUtility;
 import edu.uic.cs.jmvx.vectorclock.VectorClock;
 import org.apache.log4j.Logger;
 
@@ -10,23 +13,23 @@ import sun.misc.Signal;
 import java.io.*;
 import java.net.Socket;
 import java.net.SocketAddress;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
+import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.jar.JarFile;
+import java.util.zip.CRC32;
 
 public class Recorder extends Leader {
 
     //used to identify which jars come from JDK
     public static final String JAVA_HOME = System.getenv("JAVA_HOME");
-    private static AtomicInteger clockIndex = new AtomicInteger(0);
+    protected static AtomicInteger clockIndex = new AtomicInteger(VectorClock.START_INDEX);
 
-    private Stack classNames = new Stack();
-    private Stack classStreams = new Stack();
+    private Stack<String> classNames = new Stack();
+    private Stack<ObjectOutputStream> classStreams = new Stack();
     private static ObjectOutputStream classes;
     private static ObjectOutputStream manifests;
     private static Set<String> manifestsRecorded = new HashSet<>();
@@ -34,10 +37,12 @@ public class Recorder extends Leader {
 
     //private static ObjectOutputStream clinits;
 
-    private static final String recordingDir = System.getProperty("recordingDir", ".");
+    protected static final String recordingDir = JMVXRuntime.parameters.recordingDir;
+    protected static final boolean validateWrites = JMVXRuntime.parameters.validateWrites;
 
     private ObjectOutputStream objects;
-    private static ConcurrentHashMap<String, Flushable> streamsToFlush = new ConcurrentHashMap<>();
+    protected ReadRecorderUtility readRecorder;
+    protected static ConcurrentHashMap<String, Flushable> streamsToFlush = new ConcurrentHashMap<>();
     /*map of path to jar -> path of jar on replay. Logs where we expect to find code
     JDK classes: path -> path
     Program classes: path -> $REC/path
@@ -50,21 +55,66 @@ public class Recorder extends Leader {
 
     private static final int bufferSize = 10 * 1024 * 1024; //10 mb
 
+    //shadow the fields we wish to overwrite
+    protected static final boolean checksumCommunicationEnabled = false; //cannot use this optimization
+    protected static final boolean readsFromDisk = false; //cannot use this optimization
+    protected static final boolean circularBufferCommunicationEnabled = false; //cannot use this buffer here
+
     static {
-	Leader.checksumCommunicationEnabled = false;
-        Leader.readsFromDisk = false;
-        Leader.circularBufferCommunicationEnabled = false;
-        String role = System.getProperty(JMVXRuntime.ROLE_PROP_NAME);
-        if(role != null && role.equals(Recorder.class.getSimpleName())) {
-            //want to record, safe to alter the filesystem
-            //prevents us from truncating these files if Recorder is loaded by another class
+        String role = JMVXRuntime.parameters.role;
+        if(role != null && role.startsWith(Recorder.class.getSimpleName())) {
+            initStaticStreams();
+        }
+    }
+
+    protected static void initStaticStreams() {
+        //want to record, safe to alter the filesystem
+        //prevents us from truncating these files if Recorder is loaded by another class
+        //make a fresh recording directory when this is called
+        try {
+            JMVXRuntime.enter();
+            JMVXFile recDir = (JMVXFile) new File(recordingDir);
+            if (recDir.$JMVX$exists()) {
+                Files.walkFileTree(Paths.get(recordingDir), new FileVisitor<Path>() {
+                    @Override
+                    public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) throws IOException {
+                        return FileVisitResult.CONTINUE;
+                    }
+
+                    @Override
+                    public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                        JMVXFile f = (JMVXFile) file.toFile();
+                        f.$JMVX$delete();
+                        return FileVisitResult.CONTINUE;
+                    }
+
+                    @Override
+                    public FileVisitResult visitFileFailed(Path file, IOException exc) throws IOException {
+                        return FileVisitResult.CONTINUE;
+                    }
+
+                    @Override
+                    public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                        JMVXFile d = (JMVXFile) dir.toFile();
+                        d.$JMVX$delete();
+                        return FileVisitResult.CONTINUE;
+                    }
+                });
+            }
+
+            recDir.$JMVX$mkdirs();
+
             try {
                 clinitOut = new ObjectOutputStream(new BufferedOutputStream(new FileOutputStream(Paths.get(recordingDir, "recording.clinits.dat").toFile()), bufferSize));
                 classes = new ObjectOutputStream(new BufferedOutputStream(new FileOutputStream(Paths.get(recordingDir, "recording.classes.dat").toFile()), bufferSize));
                 manifests = new ObjectOutputStream(new BufferedOutputStream(new FileOutputStream(Paths.get(recordingDir, "recording.manifests.dat").toFile()), bufferSize));
             } catch (IOException e) {
-                throw new Error(e);
+
             }
+        } catch (IOException e){
+            throw new RuntimeException("Failed to setup recording directory", e);
+        } finally {
+            JMVXRuntime.exit();
         }
     }
 
@@ -72,23 +122,34 @@ public class Recorder extends Leader {
         if(!handlerInit){
             handlerInit = true; //no one else shall run the following code
             Signal.handle(new Signal("USR2"), signal -> {
-                flushData();
+                flushData(false);
             });
         }
     }
 
     @Override
     public void main() {
-        int tid = clockIndex.getAndIncrement();
-        JMVXRuntime.clock.registerNewThread(tid);
+        vectorClockIndex = clockIndex.getAndIncrement();
+        vectorClockIndex = JMVXRuntime.clock.registerNewThread();
+        main(vectorClockIndex, true);
+    }
 
+    /* doesn't alter the vector clock */
+    public void main(int clockIndex, boolean makeStream){
+        vectorClockIndex = clockIndex;
         try {
-            this.objects = new ObjectOutputStream(new BufferedOutputStream(new FileOutputStream(Paths.get(recordingDir, "recording." + Thread.currentThread().getName() + ".dat").toFile()), bufferSize));
-            this.objects.writeInt(tid);
-            this.objects.flush();
+            this.objects = makeStream ? new ObjectOutputStream(new BufferedOutputStream(new FileOutputStream(Paths.get(recordingDir, "recording." + Thread.currentThread().getName() + ".dat").toFile()), bufferSize)) : null;
             this.toCoordinator = this.objects;
-            synchronized (Recorder.class) {
-                streamsToFlush.put(Thread.currentThread().getName(), this.objects);
+            if(makeStream) {
+                this.toCoordinator.writeInt(vectorClockIndex);
+                this.toCoordinator.flush();
+                //need to initialize this where we can log it.
+                //because it will be initialized when we add to streamsToFlush.
+                //we miss the first one here, because JMVX is not initialized.... shit.
+                //ThreadLocalRandom.current();
+                synchronized (Recorder.class) {
+                    streamsToFlush.put(Thread.currentThread().getName(), this.objects);
+                }
             }
         } catch (IOException e) {
             throw new Error(e);
@@ -111,6 +172,40 @@ public class Recorder extends Leader {
         }
 
         super.log = Logger.getLogger(Recorder.class);
+        readRecorder = new ReadRecorderUtility(avoidObjectSerialization, circularBufferCommunicationEnabled, false);
+    }
+
+    @Override
+    protected void sendObjectToCoordinator(Serializable o) {
+        try {
+            objectCounter++;
+            toCoordinator.writeObject(o);
+            //toCoordinator.flush(); //removed to make better use of buffer
+            toCoordinator.reset();
+        } catch (IOException e) {
+            throw new Error(e);
+        }
+    }
+
+
+    /*Pass through for class loading*/
+    @Override
+    public boolean exists(JMVXFile f) {
+        if(loading == 0) {
+            return super.exists(f);
+        }else{
+            return f.$JMVX$exists();
+        }
+    }
+
+    /*Pass through for class loading*/
+    @Override
+    public long lastModified(JMVXFile f) {
+        if(loading == 0) {
+            return super.lastModified(f);
+        } else {
+            return f.$JMVX$lastModified();
+        }
     }
 
     @Override
@@ -152,6 +247,7 @@ public class Recorder extends Leader {
             clinitsStreams.push(toCoordinator);
             try {
                 toCoordinator = new ObjectOutputStream(bos);
+                //TODO: check, should this be vector clock index?
                 toCoordinator.writeObject(null); // This is needed to avoid an "IOException stream active" when calling ObjectOutputStream.reset()
             } catch (IOException e) {
                 throw new Error(e);
@@ -166,9 +262,11 @@ public class Recorder extends Leader {
         JMVXRuntime.enter();
         try {
             try {
+                this.toCoordinator.close();
+                byte[] buf = clinitsByteStreams.pop().toByteArray();
                 synchronized (clinitOut) {
                     clinitOut.writeObject(cls);
-                    clinitOut.writeObject(clinitsByteStreams.pop().toByteArray());
+                    clinitOut.writeObject(buf);
                     clinitOut.flush();
                     clinitOut.reset();
                 }
@@ -187,13 +285,13 @@ public class Recorder extends Leader {
         if (!Thread.currentThread().getName().equals(JMVXRuntime.mainThread.getName()))
             return;
 
-        flushData();
+        flushData(true);
     }
 
     /**
      * Flushes streams and copies jar files
      */
-    private static void flushData() {
+    protected static void flushData(boolean closeFiles) {
         for (Flushable f : streamsToFlush.values()) {
             try {
                 f.flush();
@@ -224,9 +322,28 @@ public class Recorder extends Leader {
                 }
             }
         });
+
+        /*
+        Terminates the streams.
+        Added for sanity.
+        Checking the behavior of RRWriter is done via the Copier class, which copies a recording
+        Leaving the closure of these streams to the JVM causes them to exclude a terminating byte,
+        which Copier adds (because it handles the streams more gracefully).
+
+        Not closing these files won't cause an error,
+        in fact, leaving them open may help us deal with code in shutdown hooks.
+        Not closing them does make verifying the RRWriter/Copier more annoying.
+         */
+        if(closeFiles) {
+            try {
+                classes.close();
+                clinitOut.close();
+            } catch (IOException _) {
+            }
+        }
     }
 
-    private int loading = 0;
+    protected int loading = 0;
 
     @Override
     public Class<?> loadClass(JMVXClassLoader loader, String name) throws ClassNotFoundException {
@@ -317,7 +434,7 @@ public class Recorder extends Leader {
                         try {
                             synchronized (Recorder.class) {
                                 toCoordinator.close();
-                                toCoordinator = (ObjectOutputStream) classStreams.pop();
+                                toCoordinator = classStreams.pop();
                                 //classNames.pop(); //done loading
                                 //assert s.equals(name); //if this is false I've messed up somewhere
                                 this.classes.writeObject(loader.getClass().getName());
@@ -353,44 +470,273 @@ public class Recorder extends Leader {
         }
     }
 
-    @Override
-    public void seek(JMVXRandomAccessFile f, long pos) throws IOException {
-        if (JMVXRuntime.avoidObjectSerialization) {
-            f.$JMVX$seek(pos);
-            return;
-        }
+    /* STOP GAP SOLUTION
+     * LeaderRecorder optimizes use of RandomAccess files, but the regular Leader does not
+     * Override them here until the optimizations are back ported
+     */
 
-        super.seek(f, pos);
+    @Override
+    public int read(JMVXRandomAccessFile f) throws IOException {
+        try {
+            int ret = f.$JMVX$read();
+            readRecorder.recordReadByte(toCoordinator, buffer, OptimizedEvent.RANDOM_ACCESS_READ, ret);
+            return ret;
+        } catch (IOException e) {
+            readRecorder.logException(toCoordinator, e);
+            throw e;
+        }
+    }
+
+    @Override
+    public int read(JMVXRandomAccessFile f, byte[] bytes) throws IOException {
+        try {
+            int ret = f.$JMVX$read(bytes);
+            readRecorder.recordRead(toCoordinator, buffer, OptimizedEvent.RANDOM_ACCESS_READ, bytes, 0, bytes.length, ret);
+            return ret;
+        } catch (IOException e) {
+            readRecorder.logException(toCoordinator, e);
+            throw e;
+        }
     }
 
     @Override
     public int read(JMVXRandomAccessFile f, byte[] bytes, int off, int len) throws IOException {
-        if (JMVXRuntime.avoidObjectSerialization) {
+        try {
             int ret = f.$JMVX$read(bytes, off, len);
-            writeFastInt(ret);
-            if (ret == 0) {
-                throw new Error();
-            }
-            if (ret > 0) {
-                byte[] arr = new byte[ret];
-                System.arraycopy(bytes, off, arr, 0, ret);
-                this.objects.writeObject(arr);
-                this.objects.reset();
-            }
+            readRecorder.recordRead(toCoordinator, buffer, OptimizedEvent.RANDOM_ACCESS_READ,
+                    bytes, off, len, ret);
             return ret;
+        } catch (IOException e) {
+            readRecorder.logException(toCoordinator, e);
+            throw e;
         }
-
-        return super.read(f, bytes, off, len);
     }
 
-    private long[] clockCopy = new long[0];
+    @Override
+    public void open(JMVXRandomAccessFile raf, String name, int mode) throws FileNotFoundException {
+        try {
+            raf.$JMVX$open(name, mode);
+            this.sendObjectToCoordinator(new Leader.RAOpen(name, mode));
+        } catch (FileNotFoundException e) {
+            this.sendObjectToCoordinator(e);
+            throw e;
+        }
+    }
+
+    /** Writes a sigil OptimizedEvent.EXCEPTION tag to indicate an exception is coming
+     * if avoidObjectSerialization is on. Otherwise, it just logs an exception
+     * This method should only be used by events that have an optimized representation
+     * eg, those which have special logic for avoidObjectSerialization */
+    private void logExceptionPossiblyWithSigil(IOException e) {
+        if(circularBufferCommunicationEnabled && avoidObjectSerialization) {
+            //placeholder to say throw an IOException...
+            //buffer.writeData(new byte[0], -1, 0, true);
+            try {
+                OptimizedEvent.writeTag(OptimizedEvent.EXCEPTION, toCoordinator);
+            } catch (IOException ex) {
+                throw new RuntimeException("Failed to write to log file", ex);
+            }
+        }
+        sendObjectToCoordinator(e);
+    }
+
+    private void logRandomAccessWriteByte(int b) {
+        try {
+            if(avoidObjectSerialization) {
+                if (validateWrites) {
+                    OptimizedEvent.writeTag(OptimizedEvent.RANDOM_ACCESS_WRITE, this.toCoordinator);
+                    this.toCoordinator.writeInt(Integer.BYTES); //b
+                    this.toCoordinator.writeInt(b);
+                } else {
+                    OptimizedEvent.writeTag(OptimizedEvent.WRITE_NO_VALIDATION, this.toCoordinator);
+                }
+            }else{
+                sendObjectToCoordinator(new Leader.RAWrite(b));
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to write to log file", e);
+        }
+    }
+
+    @Override
+    public void write(JMVXRandomAccessFile raf, int b) throws IOException {
+        try {
+            raf.$JMVX$write(b);
+            logRandomAccessWriteByte(b);
+        } catch (IOException e) {
+            logExceptionPossiblyWithSigil(e);
+            throw e;
+        }
+    }
+
+    private CRC32 crc32 = new CRC32();
+
+    private void logRandomAccessWriteByteArray(byte[] bytes) {
+        byte[] bytesToSend = checksumCommunicationEnabled ? Utils.getChecksum(bytes, crc32) : bytes;
+        try {
+            if (avoidObjectSerialization) {
+                if (validateWrites) {
+                    OptimizedEvent.writeTag(OptimizedEvent.RANDOM_ACCESS_WRITE, this.toCoordinator);
+                    this.toCoordinator.writeInt(bytes.length); //b
+                    this.toCoordinator.write(bytes, 0, bytes.length);
+                } else {
+                    OptimizedEvent.writeTag(OptimizedEvent.WRITE_NO_VALIDATION, this.toCoordinator);
+                }
+            } else {
+                sendObjectToCoordinator(new Leader.RAWriteB(bytesToSend));
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to write to log file", e);
+        }
+    }
+
+    @Override
+    public void write(JMVXRandomAccessFile raf, byte[] bytes) throws IOException {
+        try {
+            raf.$JMVX$write(bytes);
+            logRandomAccessWriteByteArray(bytes);
+        } catch (IOException e) {
+            logExceptionPossiblyWithSigil(e);
+            throw e;
+        }
+    }
+
+    private void logRandomAccessWriteWithOffsetAndLength(byte[] bytes, int off, int len) {
+        byte[] bytesToSend = checksumCommunicationEnabled ? Utils.getChecksum(bytes, off, len, crc32) : bytes;
+        try {
+            if (avoidObjectSerialization) {
+                    if(validateWrites) {
+                        OptimizedEvent.writeTag(OptimizedEvent.RANDOM_ACCESS_WRITE, this.toCoordinator);
+                        this.toCoordinator.writeInt(
+                                (Integer.BYTES * 2) //offset, len
+                                        + len //space for bytes
+                        );
+                        this.toCoordinator.writeInt(off);
+                        this.toCoordinator.writeInt(len);
+                        this.toCoordinator.write(bytes, off, len);
+                    }else{
+                        OptimizedEvent.writeTag(OptimizedEvent.WRITE_NO_VALIDATION, this.toCoordinator);
+                    }
+            } else {
+                sendObjectToCoordinator(new Leader.RAWriteBII(bytesToSend, off, len));
+            }
+        } catch(IOException e){
+            throw new RuntimeException("Failed to write to log file", e);
+        }
+    }
+
+    @Override
+    public void write(JMVXRandomAccessFile raf, byte[] bytes, int off, int len) throws IOException {
+        try {
+            raf.$JMVX$write(bytes, off, len);
+            logRandomAccessWriteWithOffsetAndLength(bytes, off, len);
+        } catch (IOException e) {
+            logExceptionPossiblyWithSigil(e);
+            throw e;
+        }
+    }
+
+    @Override
+    public void seek(JMVXRandomAccessFile f, long pos) throws IOException {
+        try {
+            f.$JMVX$seek(pos);
+            if (avoidObjectSerialization) {
+                /*byte[] data = new byte[] {
+                        (byte)  pos,
+                        (byte) (pos >> 8),
+                        (byte) (pos >> 16),
+                        (byte) (pos >> 24),
+                        (byte) (pos >> 32),
+                        (byte) (pos >> 40),
+                        (byte) (pos >> 48),
+                        (byte) (pos >> 56)};
+                buffer.writeWriteOpData(data, 0, 8, true);*/
+                //skipped when optimized
+                //TODO ACTUALLY WRITE THIS EVENT
+            } else {
+                try{
+                    f.$JMVX$seek(pos);
+                    sendObjectToCoordinator(new Leader.RASeek(pos));
+                }catch (IOException e){
+                    sendObjectToCoordinator(e);
+                }
+            }
+        } catch (IOException e) {
+            //TODO HANDLE EXCEPTION
+            throw new Error("Not supported");
+        }
+    }
+
+    protected long[] clockCopy = new long[0];
     private byte[] bytes = new byte[0];
 
+    private void writeOptimizedClock(Object o, OptimizedEvent fastTag, OptimizedEvent slowTag) {
+        /* The clock needs to be incremented no matter what
+        * The replayer needs to know how long to wait while on the slow path
+        * Incrementing on the fast path performs this bookkeeping
+        * The increments logs "how many [fast] operations do other threads need to wait for"
+        * Without the increment, the replayer may preempt fast path ops with slow path ones
+        * which should take place later */
+        VectorClock clock = JMVXRuntime.clock;
+        long[] newClockCopy = clock.increment(vectorClockIndex, clockCopy);
+        if(canTakeClockFastPath(o)){
+            writeClockFastPath(fastTag);
+        }else{
+            writeClockSlowPath(slowTag, newClockCopy);
+        }
+    }
+
+    @Override
+    protected void writeClockFastPath(OptimizedEvent fastTag) {
+        if(avoidObjectSerialization) {
+            //fast write
+            try {
+                OptimizedEvent.writeTag(fastTag, this.toCoordinator);
+            } catch (IOException e) {
+                throw new Error(e);
+            }
+        }else{
+            sendObjectToCoordinator(serializeClockEventFromTag(fastTag, null));
+        }
+    }
+
+    @Override
+    protected void writeClockSlowPath(OptimizedEvent slowTag, long[] newClockCopy) {
+        if(avoidObjectSerialization) {
+            if (newClockCopy != clockCopy) {
+                clockCopy = newClockCopy;
+                bytes = new byte[clockCopy.length * 8];
+            }
+
+        /* endianness of the system matters!
+        If you move a recording from a big to a little endian system the replayer may have issues */
+            JMVXRuntime.unsafe.copyMemory(clockCopy, CircularBuffer.longOffset, bytes, CircularBuffer.byteOffset, bytes.length);
+
+            try {
+                OptimizedEvent.writeTag(slowTag, this.toCoordinator);
+            /*
+            Size of the clock is inferred based on this
+            Less expensive to compute the size than perform more IO
+             */
+                this.toCoordinator.writeInt(
+                        //Integer.BYTES //hashcode
+                        +bytes.length //clock itself
+                );
+                //this.toCoordinator.writeInt(id);
+                this.toCoordinator.write(bytes);
+            } catch (IOException e) {
+                throw new Error(e);
+            }
+        }else{
+            sendObjectToCoordinator(serializeClockEventFromTag(slowTag, newClockCopy));
+        }
+    }
+    
     @Override
     public void monitorenter(Object o) {
         assert inClinit == 0;
 
-        if (inClinit > 0) {
+        if (inClinit > 0 || loading > 0) {
             // Don't log monitors inside class initializers
             // These should be able to be run by any thread
             // Just get the lock
@@ -398,106 +744,81 @@ public class Recorder extends Leader {
             return;
         }
 
-        if (JMVXRuntime.avoidObjectSerialization) {
-            VectorClock clock = JMVXRuntime.clock;
 
-            JMVXRuntime.unsafe.monitorEnter(o);
-
-            long[] newClockCopy = clock.increment(clockCopy);
-            if (newClockCopy != clockCopy) {
-                clockCopy = newClockCopy;
-                bytes = new byte[clockCopy.length * 8];
-            }
-
-            JMVXRuntime.unsafe.copyMemory(clockCopy, CircularBuffer.longOffset, bytes, CircularBuffer.byteOffset, bytes.length);
-
-            try {
-                this.objects.writeByte(clockCopy.length);
-                this.objects.write(bytes);
-                this.objects.reset();
-            } catch (IOException e) {
-                throw new Error(e);
-            }
-        } else {
-            super.monitorenter(o);
+        JMVXRuntime.unsafe.monitorEnter(o);
+        /* The clock needs to be incremented no matter what
+        * The replayer needs to know how long to wait while on the slow path
+        * Incrementing on the fast path performs this bookkeeping
+        * The increments logs "how many [fast] operations do other threads need to wait for"
+        * Without the increment, the replayer may preempt fast path ops with slow path ones
+        * which should take place later */
+        VectorClock clock = JMVXRuntime.clock;
+        /* IMPORTANT DISTINCTION FROM THE LEADER HERE
+        *  clockCopy and newClockCopy may be different references
+        *  Detecting that in writeClockSlowPath adjusts the `bytes` field which is used for encoding the clock
+        *  The Leader immediately changes the clockCopy reference because it can write long[] to the
+        *  circular buffer fine. */
+        if(canTakeClockFastPath(o)){
+            clock.increment(vectorClockIndex, null); //skip the array copy
+            writeClockFastPath(OptimizedEvent.FAST_MONITOR_ENTER);
+        }else{
+            long[] newClockCopy = clock.increment(vectorClockIndex, clockCopy);
+            writeClockSlowPath(OptimizedEvent.MONITOR_ENTER, newClockCopy);
         }
     }
 
     @Override
     public void wait(Object o, long timeout, int nanos) throws InterruptedException {
-        if(avoidObjectSerialization) {
-            VectorClock clock = JMVXRuntime.clock;
-            o.wait(timeout, nanos);
-            //size of the clockCopy and bytes must change in tandem!
-            long[] newClockCopy = clock.increment(clockCopy);
-            if (newClockCopy != clockCopy) {
-                clockCopy = newClockCopy;
-                bytes = new byte[clockCopy.length * 8];
-            }
-
-            JMVXRuntime.unsafe.copyMemory(clockCopy, CircularBuffer.longOffset, bytes, CircularBuffer.byteOffset, bytes.length);
-
-            try {
-                this.objects.writeByte(clockCopy.length);
-                this.objects.write(bytes);
-                this.objects.reset();
-            } catch (IOException e) {
-                throw new Error(e);
-            }
-        } else {
-            super.wait(o, timeout, nanos);
+        //VectorClock clock = JMVXRuntime.clock;
+        o.wait(timeout, nanos); //what happens if we timeout or wakeup spuriously?
+        if (inClinit > 0 || loading > 0) {
+            // Don't log monitors inside class initializers
+            // These should be able to be run by any thread
+            // Just get the lock
+            return;
+        }
+        /* The clock needs to be incremented no matter what
+        * The replayer needs to know how long to wait while on the slow path
+        * Incrementing on the fast path performs this bookkeeping
+        * The increments logs "how many [fast] operations do other threads need to wait for"
+        * Without the increment, the replayer may preempt fast path ops with slow path ones
+        * which should take place later */
+        VectorClock clock = JMVXRuntime.clock;
+        if(canTakeClockFastPath(o)){
+            clock.increment(vectorClockIndex, null); //skip the array copy
+            writeClockFastPath(OptimizedEvent.FAST_WAIT);
+        }else{
+            long[] newClockCopy = clock.increment(vectorClockIndex, clockCopy);
+            writeClockSlowPath(OptimizedEvent.WAIT, newClockCopy);
         }
     }
 
-    private void writeFastInt(int i) {
-        byte[] bb = new byte[] {
-                (byte)(i >>> 24),
-                (byte)(i >>> 16),
-                (byte)(i >>> 8),
-                (byte)i};
+    /*Didn't really help for PMD with FLUSH_AFTER = 10_000, 100_000, 250_000, or 500_000
 
-        try {
-            this.objects.writeObject(bb);
-            this.objects.reset();
-        } catch (IOException e) {
-            throw new Error(e);
-        }
-    }
+    private final int FLUSH_AFTER_MONITORS = Integer.parseInt(System.getProperty("flushAfter", "10000"));
+    private int monitorsSinceFlush = 0;
 
     @Override
-    public void write(JMVXOutputStream os, int b) throws IOException {
-        if (avoidObjectSerialization) {
+    public void monitorexit(Object o) {
+        super.monitorexit(o);
+        monitorsSinceFlush++;
+        //make sure we don't hold the lock. Avoid IO in critical sections.
+        if(monitorsSinceFlush >= FLUSH_AFTER_MONITORS && !Thread.holdsLock(o)){
             try {
-                os.$JMVX$write(b);
-                writeFastInt(b);
-            } catch(IOException e){
-                //placeholder to signal to look for an exception
-                writeFastInt(-Integer.MAX_VALUE);
-                sendObjectToCoordinator(e);
-                throw e;
-            }
-        } else {
-            super.write(os, b);
+                toCoordinator.flush();
+            }catch (IOException _){ }
+            monitorsSinceFlush = 0;
         }
-    }
+    }*/
 
     @Override
     public long currentTimeMillis() {
-
         if (avoidObjectSerialization) {
             long ret = System.currentTimeMillis();
-            byte[] b = new byte[] {
-                    (byte)  ret,
-                    (byte) (ret >> 8),
-                    (byte) (ret >> 16),
-                    (byte) (ret >> 24),
-                    (byte) (ret >> 32),
-                    (byte) (ret >> 40),
-                    (byte) (ret >> 48),
-                    (byte) (ret >> 56)};
             try {
-                this.objects.writeObject(b);
-                this.objects.reset();
+                OptimizedEvent.writeTag(OptimizedEvent.CURRENT_TIME, this.toCoordinator);
+                this.toCoordinator.writeInt(Long.BYTES);
+                this.toCoordinator.writeLong(ret);
             } catch (IOException e) {
                 throw new Error(e);
             }
@@ -508,21 +829,130 @@ public class Recorder extends Leader {
     }
 
     @Override
+    public int read(JMVXInputStream is) throws IOException {
+        try {
+            int ret = is.$JMVX$read();
+            /*NOTE: the semantics here log a ReadBII, so the return value has a different meaning!
+             * */
+            readRecorder.recordReadByte(toCoordinator, buffer, OptimizedEvent.READ, ret);
+            debug(is, ret);
+            return ret;
+        } catch (IOException e) {
+            readRecorder.logException(toCoordinator, e);
+            throw e;
+        }
+    }
+
+    @Override
+    public int read(JMVXInputStream is, byte[] bytes) throws IOException {
+        try{
+            int ret = is.$JMVX$read(bytes);
+            readRecorder.recordRead(toCoordinator, buffer, OptimizedEvent.READ,
+                    bytes, 0, bytes.length, ret);
+            debug(is, ret, bytes.length);
+            return ret;
+        } catch (IOException e) {
+            sendObjectToCoordinator(e);
+            throw e;
+        }
+    }
+
+    @Override
+    public int read(JMVXInputStream is, byte[] bytes, int off, int len) throws IOException {
+        /* Passthrough is for loading from .jar files.
+        .class files are not copied into the recording directory currenty, so we have to log them
+        We can implement a similar mechanism to zipfiles open/getEntry to save .class files used
+        during loading.
+        Need to overwrite open(JMVXFileInputStream ...), log opened .class files and check if
+        we read them (here) during loading. Or we can modify the instrumentation of
+        JMVXFileInputStream to add a getter for the path which is the source of the stream
+        and check that here. That will tell us which file to copy into the recording directory.
+
+        NOTE: the reads from .class files ARE ALWAYS SERIALIZED
+        reads when not loading may be optimized based on avoidObjectSerialization setting
+        This is a hotfix mimicking the logic in the hybrid mvx/recorder so that the replayer works with
+        both this recorder and the hybrid*/
+        if (loading > 0 && is.getClass().equals(JMVXRuntime.zipFileInputStreamClass)) {
+            return is.$JMVX$read(bytes, off, len);
+        } else {
+            try {
+                int ret = is.$JMVX$read(bytes, off, len);
+                readRecorder.recordRead(toCoordinator, buffer, OptimizedEvent.READ,
+                        bytes, off, len, ret);
+                return ret;
+            } catch (IOException e) {
+                //need the sentinel
+                readRecorder.logException(toCoordinator, e);
+                throw e;
+            }
+        }
+    }
+
+    @Override
+    public void write(JMVXOutputStream os, int b) throws IOException {
+        if (avoidObjectSerialization) {
+            try {
+                os.$JMVX$write(b);
+                if(validateWrites) {
+                    OptimizedEvent.writeTag(OptimizedEvent.WRITE, this.toCoordinator);
+                    this.toCoordinator.writeInt(Integer.BYTES); //b
+                    this.toCoordinator.writeInt(b);
+                }else{
+                    OptimizedEvent.writeTag(OptimizedEvent.WRITE_NO_VALIDATION, this.toCoordinator);
+                }
+            } catch(IOException e){
+                //placeholder to signal to look for an exception
+                OptimizedEvent.writeTag(OptimizedEvent.EXCEPTION, this.toCoordinator);
+                sendObjectToCoordinator(e);
+                throw e;
+            }
+        } else {
+            super.write(os, b);
+        }
+    }
+
+    @Override
+    public void write(JMVXOutputStream os, byte[] bytes) throws IOException {
+        if (avoidObjectSerialization) {
+            try {
+                os.$JMVX$write(bytes);
+                if(validateWrites) {
+                    OptimizedEvent.writeTag(OptimizedEvent.WRITE, this.toCoordinator);
+                    this.toCoordinator.writeInt(bytes.length); //b
+                    this.toCoordinator.write(bytes, 0, bytes.length);
+                }else{
+                    OptimizedEvent.writeTag(OptimizedEvent.WRITE_NO_VALIDATION, this.toCoordinator);
+                }
+            } catch(IOException e){
+                //placeholder to signal to look for an exception
+                OptimizedEvent.writeTag(OptimizedEvent.EXCEPTION, this.toCoordinator);
+                sendObjectToCoordinator(e);
+                throw e;
+            }
+        } else {
+            super.write(os, bytes);
+        }
+    }
+
+    @Override
     public void write(JMVXOutputStream os, byte[] bytes, int off, int len) throws IOException {
         if (avoidObjectSerialization) {
             try {
                 os.$JMVX$write(bytes, off, len);
-                if (off != 0 || len != bytes.length) {
-                    byte[] arr = new byte[len];
-                    System.arraycopy(bytes, off, arr, 0, len);
-                    this.objects.writeObject(arr);
-                } else {
-                    this.objects.writeObject(bytes);
+                if(validateWrites) {
+                    OptimizedEvent.writeTag(OptimizedEvent.WRITE, this.toCoordinator);
+                    this.toCoordinator.writeInt(
+                            (Integer.BYTES * 2) //offset, len
+                                    + len //space for bytes
+                    );
+                    this.toCoordinator.writeInt(off);
+                    this.toCoordinator.writeInt(len);
+                    this.toCoordinator.write(bytes, off, len);
+                }else{
+                    OptimizedEvent.writeTag(OptimizedEvent.WRITE_NO_VALIDATION, this.toCoordinator);
                 }
-                this.objects.reset();
             } catch(IOException e){
-                //placeholder to signal to look for an exception
-                objects.writeObject(new byte[0]);
+                OptimizedEvent.writeTag(OptimizedEvent.EXCEPTION, this.toCoordinator);
                 sendObjectToCoordinator(e);
                 throw e;
             }
@@ -534,15 +964,32 @@ public class Recorder extends Leader {
 
     @Override
     public int available(JMVXInputStream is) throws IOException {
-        if (JMVXRuntime.avoidObjectSerialization) {
+        if (avoidObjectSerialization) {
+            boolean errSrcIsJMVX = false;
+            /*
+            Avoids conflicting the error handler
+            If we merge the available call and the logging code,
+            we cannot tell if an IOException is from is.available or JMVX
+             */
             try {
                 int ret = is.$JMVX$available();
-                writeFastInt(ret);
+                errSrcIsJMVX = true;
+                OptimizedEvent.writeTag(OptimizedEvent.AVAILABLE, this.toCoordinator);
+                this.toCoordinator.writeInt(Integer.BYTES); //ret, should we make this inferred for some ops?
+                this.toCoordinator.writeInt(ret);
                 return ret;
-            } catch (IOException e) {
-                this.objects.writeObject(e);
-                this.objects.reset();
-                throw e;
+            }catch (IOException e) {
+                if (errSrcIsJMVX) {
+                    throw new Error("available failed to log result", e);
+                }else{ //log error and then throw it
+                    try{
+                        OptimizedEvent.writeTag(OptimizedEvent.EXCEPTION, this.toCoordinator);
+                        sendObjectToCoordinator(e);
+                        throw e;
+                    }catch (IOException ee){
+                        throw new Error("Failed to log result", ee);
+                    }
+                }
             }
         } else {
             return super.available(is);
@@ -619,7 +1066,7 @@ public class Recorder extends Leader {
                 else //JDK jar, path is valid unchanged
                     jarsManifest.put(rawPath, rawPath);
             } //if rawPath is null, then the Jar was opened before JMVX was init'ed and will be okay during replay
-            sendObjectToCoordinator(new Recorder.GetEntry(jzfile, name, addSlash, ret));
+            //sendObjectToCoordinator(new Recorder.GetEntry(jzfile, name, addSlash, ret));
         }
         return ret;
     }
@@ -646,7 +1093,6 @@ public class Recorder extends Leader {
     @Override
     public long open(String name, int mode, long lastModified, boolean usemmap) throws IOException {
         long ret = -1L;
-        //TODO check mode and lastModified.
         if(loading > 0){ //use the jar normally for loading
             try{
                 ret = JMVXRuntime.zipfile.$JMVX$open(name, mode, lastModified, usemmap);

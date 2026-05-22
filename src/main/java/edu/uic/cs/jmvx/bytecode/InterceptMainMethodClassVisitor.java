@@ -18,7 +18,7 @@ public class InterceptMainMethodClassVisitor extends ClassVisitor implements Opc
     private void addWrappedMethod(int access, String name, String descriptor) throws NoSuchMethodException {
         MethodVisitor mv = super.visitMethod(access, name, descriptor, null, null);
         Method mainEnter = Method.getMethod(JMVXRuntime.class.getDeclaredMethod("$JMVX$main"));
-        Method mainExit = Method.getMethod(JMVXRuntime.class.getDeclaredMethod("exitMain"));
+        Method mainExit = Method.getMethod(JMVXRuntime.class.getDeclaredMethod("exitMain", Throwable.class));
 
         //using the int because Object doesn't have an OBJECT_TYPE like the rest...
         //so comparison to an object reference has to be done using the sort/int
@@ -117,6 +117,7 @@ public class InterceptMainMethodClassVisitor extends ClassVisitor implements Opc
         }
 
         mv.visitLabel(l1);
+        mv.visitInsn(ACONST_NULL);
         mv.visitMethodInsn(INVOKESTATIC, JMVX_RUNTIME_INTERNAL_NAME, mainExit.getName(), mainExit.getDescriptor(), false);
 
         //goto return stmt
@@ -124,6 +125,7 @@ public class InterceptMainMethodClassVisitor extends ClassVisitor implements Opc
 
         mv.visitLabel(l2);
         mv.visitFrame(Opcodes.F_SAME1, 0, null, 1, new Object[]{"java/lang/Throwable"});
+        mv.visitInsn(DUP); //going to consume 1
         mv.visitVarInsn(ASTORE, execpLoc); //don't want to inc, we have to reuse later
         mv.visitMethodInsn(INVOKESTATIC, JMVX_RUNTIME_INTERNAL_NAME, mainExit.getName(), mainExit.getDescriptor(), false);
         mv.visitVarInsn(ALOAD, execpLoc);

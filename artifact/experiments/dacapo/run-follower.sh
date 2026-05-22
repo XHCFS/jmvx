@@ -17,7 +17,7 @@ fi
 
 DUMP=""
 if [ "$CORE_DUMP" != "" ]; then
-	DUMP="-DcoreDumpAtEnd=$CORE_DUMP"
+        DUMP="-c CoreDumpCallback"
 fi
 
-$JAVA_HOME/bin/java $MEM -Dlogfile="follower.log" $CIRC $DUMP -Xbootclasspath/p:$INSTALL_DIR/rt.jar:$JMVX_JAR $DEBUG $INPUT_ROLE -cp $DACAPO_INSTRUMENTED Harness $@
+$JAVA_HOME/bin/java $MEM -Dlogfile="follower.log" $CIRC -Xbootclasspath/p:$INSTALL_DIR/rt.jar:$JMVX_JAR $DEBUG $INPUT_ROLE -cp $DACAPO_INSTRUMENTED Harness $DUMP $@

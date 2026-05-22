@@ -29,9 +29,14 @@ public class BytecodeUtils implements Opcodes {
         return Type.getMethodDescriptor(Type.getReturnType(desc), argTypes);
     }
 
-    public static String[] addInterface(String[] interfaces, Type toAdd) {
+
+    public static String[] addInterface(String[] interfaces, String newInterface) {
         if (interfaces == null) interfaces = new String[0];
-        interfaces = Stream.concat(Arrays.stream(interfaces), Stream.of(toAdd.getInternalName())).toArray(String[]::new);
+        interfaces = Stream.concat(Arrays.stream(interfaces), Stream.of(newInterface)).toArray(String[]::new);
         return interfaces;
+    }
+
+    public static String[] addInterface(String[] interfaces, Type newInterface) {
+        return addInterface(interfaces, newInterface.getInternalName());
     }
 }

@@ -4,7 +4,6 @@ import edu.uic.cs.jmvx.runtime.FileDescriptorUtils;
 import edu.uic.cs.jmvx.runtime.SwitchRolesEvent;
 import edu.uic.cs.jmvx.runtime.strategy.Leader;
 import org.newsclub.net.unix.AFUNIXSocket;
-import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -13,6 +12,17 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 
+/**
+ * Handles communication between a thread in the leader and follower
+ * Note to people interested in modifying this class:
+ * Have to be careful about what operations you perform on the sockets.
+ * Leader/Follower like to use the ring buffer.
+ * Follower will run behind the leader.
+ * For a very long program (eg batik long), in rare cases it is possible for
+ * the leader's thread to finish before the follower's starts.
+ * This means the socket from the leader given to this class will have data to read,
+ * but will not be active, so you cannot adjust properties of the socket (eg timeout settings).
+ */
 public class CoordinatorThread implements Runnable {
 
     public static final String exitMessage = "RTE";
@@ -41,22 +51,12 @@ public class CoordinatorThread implements Runnable {
 
     public CoordinatorThread(ThreadContainer leader, ThreadContainer follower, AtomicInteger clockIndex) {
         this.leaderSocket = leader.getSocket();
-        try {
-            this.leaderSocket.setSoTimeout(0);
-        } catch (SocketException e) {
-            throw new Error(e);
-        }
         //leader can receive fds!
         this.leaderSocket.setAncillaryReceiveBufferSize(1024);
         this.fromLeader = leader.getObjectInputStream();
         this.toLeader = leader.out;
 
         this.followerSocket = follower.getSocket();
-        try {
-            this.followerSocket.setSoTimeout(0);
-        } catch (SocketException e) {
-            throw new Error(e);
-        }
         this.fromFollower = follower.getObjectInputStream();
         this.toFollower = follower.out;
 

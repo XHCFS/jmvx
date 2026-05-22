@@ -5,13 +5,13 @@ if [ -z "$JMVX_SOURCED" ]; then
     exit 1
 fi
 
+#DEBUG="-Xdebug -Xrunjdwp:server=y,transport=dt_socket,address=5555,suspend=n"
+
 DUMP=""
 if [ "$CORE_DUMP" != "" ]; then
-	DUMP="-DcoreDumpAtEnd=$CORE_DUMP"
+        DUMP="-c CoreDumpCallback"
 fi
-
-#DEBUG="-Xdebug -Xrunjdwp:server=y,transport=dt_socket,address=5555,suspend=n"
 
 INPUT_ROLE="-Djmvx.role=Recorder"
 
-$JAVA_HOME/bin/java $MEM -DrecordingDir="rec" $DUMP -Dlogfile="leader.log" -Xbootclasspath/p:$INSTALL_DIR/rt.jar:$JMVX_JAR $DEBUG $INPUT_ROLE -cp $DACAPO_INSTRUMENTED Harness $@
+$JAVA_HOME/bin/java $MEM -DrecordingDir="rec" -DvalidateWrites="true"  -Dlogfile="leader.log" -Xbootclasspath/p:$INSTALL_DIR/rt.jar:$JMVX_JAR $DEBUG $INPUT_ROLE -cp $DACAPO_INSTRUMENTED Harness  $DUMP $@ 

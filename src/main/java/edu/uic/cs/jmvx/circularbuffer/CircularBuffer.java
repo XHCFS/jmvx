@@ -1,6 +1,7 @@
 package edu.uic.cs.jmvx.circularbuffer;
 
 import edu.uic.cs.jmvx.runtime.JMVXRuntime;
+import edu.uic.cs.jmvx.runtime.util.OptimizedEvent;
 import sun.misc.Unsafe;
 import sun.nio.ch.FileChannelImpl;
 
@@ -15,11 +16,12 @@ public class CircularBuffer {
 
     private static final Method mmap;
     private static final Method unmmap;
-    private static final String mappedMemoryLocation = System.getProperty("mappedMemoryLocation", "/dev/shm/");
+    private static final String mappedMemoryLocation = JMVXRuntime.parameters.mappedMemoryLocation;
 
     public static final int byteOffset, longOffset;
     private long bufferSize, bufferAddress, bufferCapacity;
     private long readerPosition, writerPosition;
+    private long freeSize; //cached
 
     private static int DATA_LENGTH_SIZE_BYTES = 8;
 
@@ -54,6 +56,10 @@ public class CircularBuffer {
             backingFile.close();
         }
         catch (IOException | ReflectiveOperationException e) {
+            /* If using pre-allocated volumes/partition (eg when specifying a file other than the default /dev/shm),
+            *  check that the volume has no leftover files!
+            *  If JMVX crashes on a prior run, it may fail to deallocate the memory from the circular buffer
+            *  delete the residual file and try again.*/
             throw new Error(e);
         }
     }
@@ -247,7 +253,7 @@ public class CircularBuffer {
     }
 
     public boolean writeData(byte[] data, boolean blocking) {
-        long freeSize, dataLength, writeStartPosition, writerEndPosition, requiredSize;
+        long dataLength, writeStartPosition, writerEndPosition, requiredSize;
 
         dataLength = data.length;
 //        if(dataLength > this.bufferCapacity) {
@@ -258,10 +264,13 @@ public class CircularBuffer {
         writeStartPosition = bufferWriteOperationPointers[0];
         writerEndPosition = bufferWriteOperationPointers[1];
         requiredSize = bufferWriteOperationPointers[2];
-        freeSize = readFreeSize();
 
         /**
          * Loop if not enough space, until a read happens freeing space on the buffer
+         * Assumptions builtin this check:
+         *   1. This is the only writer to the buffer
+         *   2. The follower(reader) can only increase freeSize
+         * Use the cached value of freeSize first, if it is sufficient for the write, go ahead
          */
         while(freeSize < requiredSize && blocking == true) {
             freeSize = readFreeSize();
@@ -301,10 +310,16 @@ public class CircularBuffer {
         return false;
     }
 
-    public boolean writeData(long[] data, boolean blocking) {
-        long freeSize, dataLength, writeStartPosition, writerEndPosition, requiredSize;
+    /***
+     * Writes a vector clock to the circular buffer
+     * @param data the clock to write
+     * @param blocking whether or not to block for the write
+     * @return a boolean representing if data was written
+     */
+    public boolean writeVectorClockData(byte tagByte, long[] data, boolean blocking) {
+        long dataLength, writeStartPosition, writerEndPosition, requiredSize;
 
-        dataLength = data.length * Long.BYTES;
+        dataLength = (data.length * Long.BYTES) + OptimizedEvent.TAG_SIZE;
 //        if(dataLength > this.bufferCapacity) {
 //            throw new Error("Error! Size of write operation greater than buffer size");
 //        }
@@ -313,14 +328,14 @@ public class CircularBuffer {
         writeStartPosition = bufferWriteOperationPointers[0];
         writerEndPosition = bufferWriteOperationPointers[1];
         requiredSize = bufferWriteOperationPointers[2];
-        freeSize = readFreeSize();
 
         while(freeSize < requiredSize && blocking == true) {
             freeSize = readFreeSize();
         }
 
         if(freeSize >= requiredSize) {
-            JMVXRuntime.unsafe.copyMemory(data, longOffset, null, (this.bufferAddress + writeStartPosition + 1), dataLength);
+            JMVXRuntime.unsafe.putByteVolatile(null, this.bufferAddress + writeStartPosition + 1, tagByte);
+            JMVXRuntime.unsafe.copyMemory(data, longOffset, null, (this.bufferAddress + writeStartPosition + 1 + OptimizedEvent.TAG_SIZE), dataLength);
             JMVXRuntime.unsafe.putLongVolatile(null, this.bufferAddress + writerEndPosition + 1, 0L);
             freeSize = incrementFreeSize(freeSize, -(requiredSize - DATA_LENGTH_SIZE_BYTES));
             JMVXRuntime.unsafe.putLongVolatile(null, this.bufferAddress + writerPosition + 1, dataLength);
@@ -336,7 +351,7 @@ public class CircularBuffer {
         if ("1".equals("1"))
             throw new Error();
 
-        long freeSize, dataLength, writeStartPosition, writerEndPosition, requiredSize;
+        long dataLength, writeStartPosition, writerEndPosition, requiredSize;
 
         dataLength = Integer.BYTES;
 //        if(dataLength > this.bufferCapacity) {
@@ -347,7 +362,6 @@ public class CircularBuffer {
         writeStartPosition = bufferWriteOperationPointers[0];
         writerEndPosition = bufferWriteOperationPointers[1];
         requiredSize = bufferWriteOperationPointers[2];
-        freeSize = readFreeSize();
 
         while(freeSize < requiredSize && blocking == true) {
             freeSize = readFreeSize();
@@ -376,8 +390,8 @@ public class CircularBuffer {
      * @param blocking
      * @return
      */
-    public boolean writeData(byte[] data, int off, int len, boolean blocking) {
-        long freeSize, dataLength, writeStartPosition, writerEndPosition, requiredSize;
+    public boolean writeWriteOpData(byte[] data, int off, int len, boolean blocking) {
+        long dataLength, writeStartPosition, writerEndPosition, requiredSize;
 
         dataLength = Long.BYTES + data.length + Integer.BYTES + Integer.BYTES;
 //        if(dataLength > this.bufferCapacity) {
@@ -388,7 +402,6 @@ public class CircularBuffer {
         writeStartPosition = bufferWriteOperationPointers[0];
         writerEndPosition = bufferWriteOperationPointers[1];
         requiredSize = bufferWriteOperationPointers[2];
-        freeSize = readFreeSize();
 
         while(freeSize < requiredSize && blocking == true) {
             freeSize = readFreeSize();
@@ -396,7 +409,7 @@ public class CircularBuffer {
 
         if(freeSize >= requiredSize) {
             JMVXRuntime.unsafe.putLong(null, this.bufferAddress + writeStartPosition + 1, data.length);
-            JMVXRuntime.unsafe.copyMemory(data, byteOffset, null, this.bufferAddress + writeStartPosition + 1 + Long.BYTES, data.length);
+            JMVXRuntime.unsafe.copyMemory(data, byteOffset, null, this.bufferAddress + writeStartPosition + 1 + Long.BYTES, data.length); //this isn't a partial buffer
             JMVXRuntime.unsafe.putInt(null, this.bufferAddress + writeStartPosition + 1 + Long.BYTES + data.length, off);
             JMVXRuntime.unsafe.putInt(null, this.bufferAddress + writeStartPosition + 1 + Long.BYTES + data.length + Integer.BYTES, len);
 
@@ -420,7 +433,7 @@ public class CircularBuffer {
      * @param len number of bytes to be written
      */
     public void writeData(byte[] data, int off, int len) {
-        long freeSize, dataLength, writeStartPosition, writerEndPosition, requiredSize;
+        long dataLength, writeStartPosition, writerEndPosition, requiredSize;
 
         dataLength = len;
 //        if(dataLength > this.bufferCapacity) {
@@ -431,7 +444,6 @@ public class CircularBuffer {
         writeStartPosition = bufferWriteOperationPointers[0];
         writerEndPosition = bufferWriteOperationPointers[1];
         requiredSize = bufferWriteOperationPointers[2];
-        freeSize = readFreeSize();
 
         while(freeSize < requiredSize) {
             freeSize = readFreeSize();
@@ -565,30 +577,40 @@ public class CircularBuffer {
      * @param off offset into byte array b, starting at which data is copied
      * @param len length of the byte array b
      * @return returns the number of bytes read during this operation
+     * or the negative of the minimum capacity of a buffer required for the read
      */
     public int readData(byte[] b, int off, int len) {
-        long dataLength, freeSize, readStartPosition, readerEndPosition, padding;
+        long dataLength, freeSize, readStartPosition, readerEndPosition;
         int skippedBytes = 0;
+        long padding = 0;
 
         freeSize = readFreeSize();
 
+        /** CHANGE 09/12/25
+         * fields and buffer freeSize should not be changed until AFTER the method gets past the data length check
+         * This way, failing to fill a buffer aborts the operation, without modifying the contents of the buffer
+         * The JMVXFastCircularBufferInputStream uses this property to reallocate and retry a read.
+         */
+
         if((readerPosition +  DATA_LENGTH_SIZE_BYTES) > this.bufferSize) {
             skippedBytes = (int)(this.bufferSize - readerPosition);
-            freeSize = incrementFreeSize(freeSize, skippedBytes);
-            readerPosition = READER_START_POSITION;
-            skippedBytes = 0;
+            readStartPosition = READER_START_POSITION;
+            //skippedBytes = 0;
         }
         else {
             padding = (8 - (readerPosition % 8)) % 8;
-            freeSize = incrementFreeSize(freeSize, padding);
-            readerPosition += padding;
+            readStartPosition = readerPosition + padding;
         }
 
         dataLength = 0;
         while(dataLength == 0) {
-            dataLength = JMVXRuntime.unsafe.getLongVolatile(null, bufferAddress + readerPosition);
+            dataLength = JMVXRuntime.unsafe.getLongVolatile(null, bufferAddress + readStartPosition);//bufferAddress + readerPosition);
             if(dataLength > len) {
-                throw new Error("Insufficient buffer size. Cannot complete the read operation!");
+                if(dataLength > Integer.MAX_VALUE){
+                    throw new Error("Cannot return the size we need");
+                }
+                return -(int)dataLength; //cannot fill the buffer
+                //throw new Error("Insufficient buffer size. Cannot complete the read operation!");
             }
 //	    if(dataLength-16 > len) {
 //              throw new Error("Insufficient buffer size. Cannot complete the read operation!");
@@ -599,6 +621,11 @@ public class CircularBuffer {
 //            throw new Error("Invalid read size. Cannot read " + dataLength + " bytes!");
 //        }
 
+        /** Buffer size is sufficient, a read should succeed, modifications are safe now */
+
+        readerPosition = readStartPosition;
+        freeSize = incrementFreeSize(freeSize, padding + skippedBytes);
+        skippedBytes = 0;
         readStartPosition = readerPosition + DATA_LENGTH_SIZE_BYTES;
         readerEndPosition = readStartPosition + dataLength;
 

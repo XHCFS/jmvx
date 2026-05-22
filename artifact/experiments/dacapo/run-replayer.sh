@@ -7,7 +7,7 @@ fi
 
 DUMP=""
 if [ "$CORE_DUMP" != "" ]; then
-	DUMP="-DcoreDumpAtEnd=$CORE_DUMP"
+        DUMP="-c CoreDumpCallback"
 fi
 
 #DEBUG="-Xdebug -Xrunjdwp:server=y,transport=dt_socket,address=5556,suspend=n"
@@ -15,5 +15,5 @@ fi
 
 INPUT_ROLE="-Djmvx.role=Replayer"
 
-$JAVA_HOME/bin/java $MEM -DrecordingDir="rec" $OPS $DUMP -Dlogfile="follower.log" -Xbootclasspath/p:$INSTALL_DIR/rt.jar:$JMVX_JAR $DEBUG $INPUT_ROLE -cp $DACAPO_INSTRUMENTED Harness $@
+$JAVA_HOME/bin/java $MEM -DrecordingDir="rec" $OPS -Dlogfile="follower.log" -Xbootclasspath/p:$INSTALL_DIR/rt.jar:$JMVX_JAR $DEBUG $INPUT_ROLE -cp $DACAPO_INSTRUMENTED Harness $DUMP $@
 

@@ -1,12 +1,16 @@
 package edu.uic.cs.jmvx.bytecode;
 
+import com.thoughtworks.xstream.core.JVM;
 import edu.uic.cs.jmvx.runtime.JMVXRuntime;
 import org.apache.log4j.Logger;
 import org.objectweb.asm.*;
 import org.objectweb.asm.commons.Method;
 
+import java.util.Arrays;
 import java.util.HashSet;
+import java.util.Random;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.ThreadPoolExecutor;
 
 public class SynchronizedClassVisitor extends ClassVisitor implements Opcodes {
@@ -53,11 +57,19 @@ public class SynchronizedClassVisitor extends ClassVisitor implements Opcodes {
         DENY_LIST.add("org/apache/xpath/axes/IteratorPool");
         DENY_LIST.add("org/apache/xml/utils/ObjectPool");*/
 	//DENY_LIST.add("org/h2/message/TraceSystem");
-        JVM_WHITE_LIST.add(Type.getInternalName(ThreadPoolExecutor.class));
+
+
+        /*JVM_WHITE_LIST.addAll(Arrays.asList(new String[]{
+                Type.getInternalName(Random.class),
+                Type.getInternalName(ThreadLocalRandom.class),
+        }));*/
+
+        //Trying to remove these
+        //JVM_WHITE_LIST.add(Type.getInternalName(ThreadPoolExecutor.class));
         // This is a private class, so I have to list it manually
-        JVM_WHITE_LIST.add("java/util/concurrent/ExecutorCompletionService$QueueingFuture");
+        //JVM_WHITE_LIST.add("java/util/concurrent/ExecutorCompletionService$QueueingFuture");
         // poll needs to return in the same order on the follower/replayer
-        JVM_WHITE_LIST.add(Type.getInternalName(ConcurrentLinkedQueue.class));
+        //JVM_WHITE_LIST.add(Type.getInternalName(ConcurrentLinkedQueue.class));
     }
 
     public SynchronizedClassVisitor(ClassLoader loader, ClassVisitor classVisitor) {

@@ -1,6 +1,8 @@
 package edu.uic.cs.jmvx.runtime.strategy;
 
 import edu.uic.cs.jmvx.runtime.*;
+import edu.uic.cs.jmvx.runtime.pools.JMVXJob;
+import edu.uic.cs.jmvx.runtime.pools.JMVXQueueingFuture;
 import sun.nio.fs.UnixException;
 import sun.nio.fs.UnixFileAttributes;
 import sun.nio.fs.UnixPath;
@@ -16,18 +18,26 @@ import java.nio.file.AccessMode;
 import java.nio.file.CopyOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileAttribute;
-import java.nio.file.attribute.PosixFileAttributes;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ThreadFactory;
 
-public class ReentrantStrategy implements JMVXStrategy {
-    private final JMVXStrategy strategy;
-    private final JMVXStrategy passthrough = new SingleLeaderWithoutCoordinator();
+/* Generic so the code can be reused
+* */
+public class ReentrantStrategy <Strategy extends JMVXStrategy, Passthrough extends JMVXStrategy> implements JMVXStrategy {
+    protected final Strategy strategy;
+    protected final Passthrough passthrough;// = new SingleLeaderWithoutCoordinator();
 
-    private JMVXStrategy inUse;
+    protected JMVXStrategy inUse;
     private int depth = 0;
 
-    public ReentrantStrategy(JMVXStrategy strategy) {
+    public ReentrantStrategy(Strategy strategy, Passthrough passthrough) {
         this.strategy = strategy;
+        this.passthrough = passthrough;
         this.inUse = this.strategy;
+    }
+
+    public static <Strategy extends JMVXStrategy> ReentrantStrategy singleLeaderPassthrough(Strategy s){
+        return new ReentrantStrategy(s, new SingleLeaderWithoutCoordinator());
     }
 
     @Override
@@ -706,7 +716,7 @@ public class ReentrantStrategy implements JMVXStrategy {
     public long nanoTime() {
         enter();
         try{
-            return this.strategy.nanoTime();
+            return this.inUse.nanoTime();
         }finally {
             exit();
         }
@@ -1207,5 +1217,60 @@ public class ReentrantStrategy implements JMVXStrategy {
         }finally {
             exit();
         }
+    }
+
+
+    @Override
+    public void beforeExecute(Thread t, JMVXJob r) {
+        try{
+            enter();
+            inUse.beforeExecute(t, r);
+        }finally {
+            exit();
+        }
+    }
+
+    @Override
+    public void afterExecute(JMVXJob r, Throwable t) {
+        try{
+            enter();
+            inUse.afterExecute(r, t);
+        }finally {
+            exit();
+        }
+    }
+
+    @Override
+    public void submit(JMVXJob task) {
+        try{
+            enter();
+            inUse.submit(task);
+        }finally {
+            exit();
+        }
+    }
+
+    @Override
+    public void runnableFutureDone(JMVXQueueingFuture future) {
+        try{
+            enter();
+            inUse.runnableFutureDone(future);
+        }finally {
+            exit();
+        }
+    }
+
+    @Override
+    public ExecutorService newFixedThreadPool(int nThreads, ThreadFactory threadFactory) {
+        /* jme creates the thread pool in a static initializer
+        *  Leader/Follower use an `enter` at the start of an initializer to allow the code to run through
+        *  Meaning the SingleLeader would be responsible for the thread pool instead of the Leader/Follower
+        *  Recorder/Replayer has a log of events.*/
+        return strategy.newFixedThreadPool(nThreads, threadFactory);
+    }
+
+    @Override
+    public ExecutorService newCachedThreadPool(ThreadFactory threadFactory) {
+        return strategy.newCachedThreadPool(threadFactory);
     }
 }

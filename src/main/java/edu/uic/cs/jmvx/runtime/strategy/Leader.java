@@ -3,6 +3,9 @@ package edu.uic.cs.jmvx.runtime.strategy;
 import edu.uic.cs.jmvx.coordinate.CoordinatorThread;
 import edu.uic.cs.jmvx.runtime.*;
 import edu.uic.cs.jmvx.coordinate.Coordinator;
+import edu.uic.cs.jmvx.runtime.pools.*;
+import edu.uic.cs.jmvx.runtime.util.OptimizedEvent;
+import edu.uic.cs.jmvx.runtime.util.UIDedObject;
 import org.apache.log4j.Logger;
 import edu.uic.cs.jmvx.runtime.JMVXSocket;
 import org.newsclub.net.unix.AFUNIXSocket;
@@ -28,16 +31,13 @@ import java.net.Socket;
 import java.net.SocketAddress;
 import java.net.*;
 import java.nio.ByteBuffer;
-import java.nio.file.AccessMode;
-import java.nio.file.CopyOption;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.nio.file.*;
 import java.nio.file.attribute.FileAttribute;
 import java.util.ArrayList;
 import java.util.Optional;
 import java.util.Stack;
 import java.util.TimeZone;
-import java.util.concurrent.Callable;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.ZipFile;
@@ -65,7 +65,7 @@ public class Leader implements JMVXStrategy {
     protected boolean connected = false;
     protected static Logger log;
     boolean promoteDemoteEnabled = true; // use promoteDemoteEnabled = ture, when testing a specific method
-    private static final boolean fastExit = System.getProperty("fastExit", "true").equals("true");
+    private static final boolean fastExit = JMVXRuntime.parameters.fastExit;
 
     private static AFUNIXSocket clinitSocket;
     protected static ObjectOutputStream clinitOut;
@@ -79,15 +79,19 @@ public class Leader implements JMVXStrategy {
     private CRC32 crc32 = new CRC32();
     CircularBuffer buffer = null;
 
-    protected static boolean checksumCommunicationEnabled = JMVXRuntime.checksumCommunicationEnabled;
-    protected static boolean readsFromDisk = JMVXRuntime.readsFromDisk;
-    protected static boolean circularBufferCommunicationEnabled = JMVXRuntime.circularBufferCommunicationEnabled;
-    protected static boolean avoidObjectSerialization = JMVXRuntime.avoidObjectSerialization;
-    protected static boolean useBufferBackedStreams = JMVXRuntime.useBufferBackedStreams;
+    protected static final boolean checksumCommunicationEnabled = JMVXRuntime.parameters.checksumCommunicationEnabled;
+    protected static final boolean readsFromDisk = JMVXRuntime.parameters.readsFromDisk;
+    protected static final boolean circularBufferCommunicationEnabled = JMVXRuntime.parameters.circularBufferCommunicationEnabled;
+    protected static final boolean avoidObjectSerialization = JMVXRuntime.parameters.avoidObjectSerialization;
+    protected static final boolean useBufferBackedStreams = JMVXRuntime.parameters.useBufferBackedStreams;
+    protected static final boolean computePartialOrders = JMVXRuntime.parameters.computePartialOrders;
 
     private static final AtomicBoolean isExecuting;
 
     private static final int junkPort = 10000;
+
+    /* Used as a reference to the owner of an object for partial ordering */
+    protected Object monitorOwnerRef = this;
 
     static {
         isExecuting = new AtomicBoolean();
@@ -106,6 +110,8 @@ public class Leader implements JMVXStrategy {
             JMVXRuntime.exit();
         }
     }
+
+    protected int vectorClockIndex = -1;
 
     protected void sendMode() throws IOException {
         //Value is stored in Boolean lockstepMode on Coordinator
@@ -165,6 +171,14 @@ public class Leader implements JMVXStrategy {
         }
     }
 
+    public static InputStream maybeBufferedInputStream(InputStream toDecorate){
+        return useBufferBackedStreams ? new BufferedInputStream(toDecorate) : toDecorate;
+    }
+
+    public static OutputStream maybeBufferedOutputStream(OutputStream toDecorate){
+        return useBufferBackedStreams ? new BufferedOutputStream(toDecorate) : toDecorate;
+    }
+
     @Override
     public void main() {
         // Make sure ObjectOutputStream is fully initialized
@@ -210,43 +224,41 @@ public class Leader implements JMVXStrategy {
 //                throw new Error("Buffer initialization failed");
 //            }
 
-            if(useBufferBackedStreams) {
-                CircularBufferOutputStream bufferOutputStream = new CircularBufferOutputStream(buffer);
-                try {
-                    toBufferStream = new ObjectOutputStream(new BufferedOutputStream(bufferOutputStream));
-                    toBufferStream.flush();
-                    toBufferStream.reset();
-                } catch (IOException e) {
-                    throw new Error(e);
-                }
-                toSocketStream = toCoordinator;
-                toCoordinator = toBufferStream;
-                fromSocketStream = fromCoordinator;
-                try {
-                    this.fromCoordinator = new ObjectInputStream(new InputStream() {
-                        @Override
-                        public int read() throws IOException {
-                            throw new IOException("The leader cannot read from the ring buffer");
-                        }
-                    }) {
-                        @Override
-                        protected void readStreamHeader() throws IOException, StreamCorruptedException {
-                            return;
-                        }
-                    };
-                    fromBufferStream = this.fromCoordinator;
-                } catch (IOException e) {
-                    throw new Error(e);
-                }
+            CircularBufferOutputStream bufferOutputStream = new CircularBufferOutputStream(buffer);
+            try {
+                toBufferStream = new ObjectOutputStream(maybeBufferedOutputStream(bufferOutputStream));
+                toBufferStream.flush();
+                toBufferStream.reset();
+            } catch (IOException e) {
+                throw new Error(e);
             }
-            else {
-                toBufferStream = toCoordinator;
-                toSocketStream = toCoordinator;
-                fromSocketStream = fromCoordinator;
-                fromBufferStream = fromCoordinator;
+            toSocketStream = toCoordinator;
+            toCoordinator = toBufferStream;
+            fromSocketStream = fromCoordinator;
+            try {
+                this.fromCoordinator = new ObjectInputStream(new InputStream() {
+                    @Override
+                    public int read() throws IOException {
+                        throw new IOException("The leader cannot read from the ring buffer");
+                    }
+                }) {
+                    @Override
+                    protected void readStreamHeader() throws IOException, StreamCorruptedException {
+                        return;
+                    }
+                };
+                fromBufferStream = this.fromCoordinator;
+            } catch (IOException e) {
+                throw new Error(e);
             }
+        } else {
+            toBufferStream = toCoordinator;
+            toSocketStream = toCoordinator;
+            fromSocketStream = fromCoordinator;
+            fromBufferStream = fromCoordinator;
         }
 
+        monitorOwnerRef = this;
     }
 
     private static Object clinit = new Object();
@@ -321,12 +333,12 @@ public class Leader implements JMVXStrategy {
         JMVXRuntime.unsafe.monitorExit(Leader.class);
     }
 
-    private static AtomicInteger threadID = new AtomicInteger(0);
-
     public void connect(int port) {
         if (!connected) {
             boolean coordinatorReady;
-            int clockIndex;
+            /*TODO refactor to unify with Recorder's field for clockIndex
+             * This will help with porting Thread Pool support later */
+            vectorClockIndex = JMVXRuntime.clock.registerNewThread();
             while (true) {
                 try {
                     //uncomment if using inDepthClinit
@@ -334,18 +346,14 @@ public class Leader implements JMVXStrategy {
 
                     leaderSocket = AFUNIXSocket.newInstance();
                     leaderSocket.connect(Coordinator.LEADER_COMMS_ADDR);
-                    toCoordinator = new ObjectOutputStream(leaderSocket.getOutputStream());
-
-                    int id = threadID.getAndIncrement();
+                    toCoordinator = new ObjectOutputStream(maybeBufferedOutputStream(leaderSocket.getOutputStream()));
 
                     toCoordinator.writeObject(Thread.currentThread().getName());
-                    toCoordinator.writeInt(id);
+                    toCoordinator.writeInt(vectorClockIndex);
                     toCoordinator.flush();
 
-                    fromCoordinator = new ObjectInputStream(leaderSocket.getInputStream());
+                    fromCoordinator = new ObjectInputStream(maybeBufferedInputStream(leaderSocket.getInputStream()));
 //                    clockIndex = fromCoordinator.readInt();
-
-                    clockIndex = id;
 
                     sendMode();
 //                    coordinatorReady = fromCoordinator.readBoolean();
@@ -367,7 +375,6 @@ public class Leader implements JMVXStrategy {
                     }
                 }
             }
-            JMVXRuntime.clock.registerNewThread(clockIndex);
             connected = true;
         }
     }
@@ -512,7 +519,7 @@ public class Leader implements JMVXStrategy {
             int ret = is.$JMVX$read(bytes, off, len);
             if (circularBufferCommunicationEnabled) {
                 if (avoidObjectSerialization) {
-                    buffer.writeData(bytes, off, ret, true);
+                    buffer.writeWriteOpData(bytes, off, ret, true);
                 } else {
                     ReadBII rbii = new ReadBII(ret, bytes, off, len);
                     this.writeToCircularBuffer(rbii);
@@ -520,7 +527,7 @@ public class Leader implements JMVXStrategy {
                 return ret;
             } else {
                 sendObjectToCoordinator(new ReadBII(ret, bytes, off, len));
-                log.info("READBII " + objectCounter);
+                //log.info("READBII " + objectCounter);
                 return ret;
             }
         } catch (IOException e) {
@@ -533,7 +540,7 @@ public class Leader implements JMVXStrategy {
     public int available(JMVXInputStream is) throws IOException {
         try {
             int ret = is.$JMVX$available();
-            if (JMVXRuntime.avoidObjectSerialization) {
+            if (avoidObjectSerialization) {
                 byte[] b = new byte[]{
                         (byte)(ret >>> 24),
                         (byte)(ret >>> 16),
@@ -599,6 +606,7 @@ public class Leader implements JMVXStrategy {
             if(circularBufferCommunicationEnabled) {
                 if(avoidObjectSerialization) {
                     byte data[] = new byte[Integer.BYTES];
+                    //WHY DOES THIS NEED AN UNSAFE OP
                     JMVXRuntime.unsafe.putInt(data, Unsafe.ARRAY_BYTE_BASE_OFFSET, b);
                     buffer.writeData(data, true);
                 }
@@ -611,6 +619,7 @@ public class Leader implements JMVXStrategy {
                 sendObjectToCoordinator(new Write(b));
             }
         } catch (IOException e) {
+            //WE DON'T SEND THE EXCEPTION IF THE BUFFER EXISTS? WHAT?
             if(!circularBufferCommunicationEnabled) {
                 sendObjectToCoordinator(e);
             }
@@ -629,7 +638,7 @@ public class Leader implements JMVXStrategy {
             sendObjectToCoordinator(new SwitchRolesEvent());
             Follower strategy = new Follower();
             strategy.reConnect(leaderSocket, toCoordinator, fromCoordinator, log);
-            JMVXRuntime.setStrategy(new ReentrantStrategy(strategy));
+            JMVXRuntime.setStrategy(ReentrantStrategy.singleLeaderPassthrough(strategy));
             JMVXRuntime.openExistingFilesToNull();
             try {
                 return function.call();
@@ -716,7 +725,7 @@ public class Leader implements JMVXStrategy {
 
             if(circularBufferCommunicationEnabled) {
                 if(avoidObjectSerialization) {
-                    buffer.writeData(bytesToSend, off, len, true);
+                    buffer.writeWriteOpData(bytesToSend, off, len, true);
                 }
                 else {
                     WriteBII wbii =  new WriteBII(bytesToSend, off, len);
@@ -730,7 +739,7 @@ public class Leader implements JMVXStrategy {
             if(circularBufferCommunicationEnabled) {
                 if(avoidObjectSerialization) {
                     //placeholder to say throw an IOException...
-                    buffer.writeData(new byte[0], -1, 0, true);
+                    buffer.writeWriteOpData(new byte[0], -1, 0, true);
                 }
                 else {
                     this.writeToCircularBuffer(e);
@@ -1373,6 +1382,86 @@ public class Leader implements JMVXStrategy {
 
     private long[] clockCopy = new long[0];
 
+    protected Object getMonitorOwnerReference(){
+        return monitorOwnerRef;
+    }
+
+    protected boolean canTakeClockFastPath(Object o){
+        /* partial order optimization during recording
+         * the first use of a monitor gets the fast path
+         * if the owner of a monitor has not changed, then use the fast path
+         *
+         * Slow path will force a sync on the replayer when the monitor changes owners
+         * OR if the object belongs to java.lang (eg is not an instance of UIDedObject)
+         *
+         * Note: this method assumes that you have grabbed the object monitors and are checking
+         * against the prior owner. This assumption allows us to be STATEFUL
+         * the last owner is replaced
+         * */
+        if(computePartialOrders && o instanceof UIDedObject) {
+            UIDedObject u = (UIDedObject) o;
+            Object priorOwner = u.getLastOwner();
+            Object ownerRef = getMonitorOwnerReference();
+            //priorOwner==null means no one owned the monitor before
+            if (priorOwner == ownerRef) {
+                return true; //can take the fast path
+            }else{
+                u.setLastOwner(ownerRef);
+            }
+        }
+        return false; //cannot take the fast path
+    }
+
+    /*
+    Method is a bit of a hack.
+    Rather than having 2 methods for monitorEnterFastPath and waitFastPath, there is one
+    That method uses this one to figure out what type of object to serialize
+     */
+    protected Serializable serializeClockEventFromTag(OptimizedEvent tag, long[] clockCopy){
+        switch (tag){
+            case MONITOR_ENTER:
+            case FAST_MONITOR_ENTER:
+                return new MonitorEnter(clockCopy, tag);
+            case WAIT:
+            case FAST_WAIT:
+                return new Wait(clockCopy, 0, tag);
+            default:
+                throw new Error("Cannot create an object for a vc event from " + tag.name());
+        }
+    }
+
+    public static final long[] NO_CLOCK = new long[0];
+
+    /* Log a monitor fast path */
+    protected void writeClockFastPath(OptimizedEvent fastTag) {
+        if(circularBufferCommunicationEnabled) {
+            if(avoidObjectSerialization) {
+                buffer.writeVectorClockData((byte)fastTag.ordinal(), NO_CLOCK, true);
+            }
+            else {
+                this.writeToCircularBuffer(serializeClockEventFromTag(fastTag, null));
+            }
+        }
+        else {
+            this.sendObjectToCoordinator(serializeClockEventFromTag(fastTag, null));
+        }
+    }
+
+    /* Log a monitor slow path */
+    protected void writeClockSlowPath(OptimizedEvent slowTag, long[] newClockCopy){
+        if(circularBufferCommunicationEnabled) {
+            if(avoidObjectSerialization) {
+                buffer.writeVectorClockData((byte)slowTag.ordinal(), newClockCopy, true);
+            }
+            else {
+                this.writeToCircularBuffer(serializeClockEventFromTag(slowTag, newClockCopy));
+            }
+        }
+        else {
+            this.sendObjectToCoordinator(serializeClockEventFromTag(slowTag, newClockCopy));
+        }
+    }
+
     @Override
     public void monitorenter(Object o) {
         /*if(inClinit.get() > 0){
@@ -1386,24 +1475,14 @@ public class Leader implements JMVXStrategy {
 //        }
 
         VectorClock clock = JMVXRuntime.clock;
-
         JMVXRuntime.unsafe.monitorEnter(o);
 
-        clockCopy = clock.increment(clockCopy);
-
-        MonitorEnter me;
-        if(circularBufferCommunicationEnabled) {
-            if(avoidObjectSerialization) {
-                buffer.writeData(clockCopy, true);
-            }
-            else {
-                me = new MonitorEnter(clockCopy);
-                this.writeToCircularBuffer(me);
-            }
-        }
-        else {
-            me = new MonitorEnter(clockCopy);
-            this.sendObjectToCoordinator(me);
+        if(canTakeClockFastPath(o)){
+            clock.increment(vectorClockIndex, null); //avoid the array copy
+            writeClockFastPath(OptimizedEvent.FAST_MONITOR_ENTER);
+        }else{
+            clockCopy = clock.increment(vectorClockIndex, clockCopy);
+            writeClockSlowPath(OptimizedEvent.MONITOR_ENTER, clockCopy);
         }
     }
 
@@ -1416,30 +1495,15 @@ public class Leader implements JMVXStrategy {
     //we don't want to modify the vector clock in that case (or send clock objects)
     @Override
     public void wait(Object o, long timeout, int nanos) throws InterruptedException {
-        /*if(inClinit.get() > 0){
-            o.wait(timeout, nanos);
-            return;
-        }*/
-
         VectorClock clock = JMVXRuntime.clock;
-
         o.wait(timeout, nanos);
 
-        clockCopy = clock.increment(clockCopy);
-
-        Wait wt;
-        if(circularBufferCommunicationEnabled) {
-            if(avoidObjectSerialization) {
-                buffer.writeData(clockCopy, true);
-            }
-            else {
-                wt = new Wait(clockCopy);
-                this.writeToCircularBuffer(wt);
-            }
-        }
-        else {
-            wt = new Wait(clockCopy);
-            this.sendObjectToCoordinator(wt);
+        if(canTakeClockFastPath(o)){
+            clock.increment(vectorClockIndex, null); //avoid the array copy
+            writeClockFastPath(OptimizedEvent.FAST_WAIT);
+        }else{
+            clockCopy = clock.increment(vectorClockIndex, clockCopy);
+            writeClockSlowPath(OptimizedEvent.WAIT, clockCopy);
         }
     }
 
@@ -1450,6 +1514,7 @@ public class Leader implements JMVXStrategy {
 
     @Override
     public void threadExit(Runnable r) {
+        JMVXRuntime.clock.unregisterThread(vectorClockIndex);
         exitLogic();
     }
 
@@ -1474,6 +1539,11 @@ public class Leader implements JMVXStrategy {
             else
                 toCoordinator.writeObject(CoordinatorThread.exitMessage); //want coordinator thread to start listening to the follower
             toCoordinator.flush();
+
+            /*if(Thread.currentThread() instanceof JMVXThreadFactory.JMVXPoolThread){
+                toCoordinator.
+            }*/
+
             if(!fastExit) {
                 //wait for the coordinator to tell us the follower has exited
                 fromCoordinator.readObject(); //wait for ACK
@@ -1579,7 +1649,7 @@ public class Leader implements JMVXStrategy {
             try {
                 int ret = f.$JMVX$read(bytes, off, len);
                 if (avoidObjectSerialization) {
-                    buffer.writeData(bytes, off, ret, true);
+                    buffer.writeWriteOpData(bytes, off, ret, true);
                 } else {
                     RAReadBII rbii = new RAReadBII(ret, bytes, off, len);
                     this.writeToCircularBuffer(rbii);
@@ -1689,7 +1759,7 @@ public class Leader implements JMVXStrategy {
                             (byte) (pos >> 40),
                             (byte) (pos >> 48),
                             (byte) (pos >> 56)};
-                    buffer.writeData(data, 0, 8, true);
+                    buffer.writeWriteOpData(data, 0, 8, true);
                 } else {
                     RASeek raseek = new RASeek(pos);
                     this.writeToCircularBuffer(raseek);
@@ -1750,7 +1820,7 @@ public class Leader implements JMVXStrategy {
     public long currentTimeMillis() {
         long ret = System.currentTimeMillis();
 
-        if (JMVXRuntime.avoidObjectSerialization && JMVXRuntime.circularBufferCommunicationEnabled) {
+        if (avoidObjectSerialization && circularBufferCommunicationEnabled) {
             byte[] b = new byte[] {
                     (byte)  ret,
                     (byte) (ret >> 8),
@@ -2094,7 +2164,55 @@ public class Leader implements JMVXStrategy {
         return ret;
     }
 
-    /*default*/ static class Read implements Serializable {
+    @Override
+    public ExecutorService newFixedThreadPool(int nThreads, ThreadFactory threadFactory) {
+        JMVXThreadPoolExecutor pool = new PessimisticExecutor(nThreads, nThreads,
+                0L, TimeUnit.MILLISECONDS,
+                new JMVXThreadFactory(Optional.ofNullable(threadFactory)));
+        return pool;
+    }
+
+    @Override
+    public ExecutorService newCachedThreadPool(ThreadFactory threadFactory) {
+        /* linked blocking queue won't obey the stamps on the jobs
+        * but the follower doesn't need the order to be explicitly followed
+        * because the leader will tell the follower's worker which job to take, based on the stamp */
+        JMVXThreadPoolExecutor pool = new JMVXThreadPoolExecutor(0, Integer.MAX_VALUE,
+                60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(),
+                new JMVXThreadFactory(Optional.ofNullable(threadFactory)));
+        return pool;
+    }
+
+    @Override
+    public void beforeExecute(Thread t, JMVXJob r) {
+        //send the stamp of our job to the follower
+        //this is the job we get back from the scheduler
+        monitorOwnerRef = r;
+        sendObjectToCoordinator(new JobStarted(r.$JMVX$getClock()));
+    }
+
+    @Override
+    public void afterExecute(JMVXJob r, Throwable t) {
+        /* Maybe we can just run? No stream state to reset */
+        monitorOwnerRef = this;
+    }
+
+    @Override
+    public void submit(JMVXJob task) {
+        //send stamp we created to the follower
+        int workerId = task.$JMVX$getClock();
+        sendObjectToCoordinator(new RecorderWithPools.JobCreated(workerId));
+    }
+
+    @Override
+    public void runnableFutureDone(JMVXQueueingFuture future) {
+        //send stamp we created to the follower
+        int stamp = future.tick();
+        sendObjectToCoordinator(new RecorderWithPools.TaskFinished(stamp));
+    }
+
+    public static class Read implements Serializable {
         private static final long serialVersionUID = 8248701411369551163L;
         public final int ret;
 
@@ -2103,7 +2221,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    /*default*/ static class ReadB implements Serializable {
+    /*default*/ public static class ReadB implements Serializable {
         private static final long serialVersionUID = -7753689735171121522L;
         public final int ret;
         public final byte[] b;
@@ -2114,7 +2232,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    /*default*/ static class ReadBII implements Serializable {
+    /*default*/ public static class ReadBII implements Serializable {
         private static final long serialVersionUID = -8166362716492380175L;
         public final int ret;
         public final byte[] b;
@@ -2128,13 +2246,13 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    /*default*/ static class Available implements Serializable {
+    /*default*/ public static class Available implements Serializable {
         private static final long serialVersionUID = -8738498116207867056L;
         public final int ret;
         public Available(int ret) { this.ret = ret; }
     }
 
-    /*default*/ static class Write implements Serializable {
+    /*default*/ public static class Write implements Serializable {
         private static final long serialVersionUID = -1275307460146515728L;
         public final int b;
 
@@ -2143,7 +2261,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    /*default*/ static class WriteB implements Serializable {
+    /*default*/ public static class WriteB implements Serializable {
         private static final long serialVersionUID = -5864970803544372903L;
         public final byte[] b;
 
@@ -2152,7 +2270,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    /*default*/ static class WriteBII implements Serializable {
+    /*default*/ public static class WriteBII implements Serializable {
         private static final long serialVersionUID = -7471915106796087089L;
         public final byte[] b;
         public final int off, len;
@@ -2164,7 +2282,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileCanRead implements Serializable {
+    public static class FileCanRead implements Serializable {
         private static final long serialVersionUID = -538337334067959266L;
         public final boolean ret;
 
@@ -2173,7 +2291,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileCanWrite implements Serializable {
+    public static class FileCanWrite implements Serializable {
         private static final long serialVersionUID = -2251054193655571397L;
         public final boolean ret;
 
@@ -2182,7 +2300,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileCreateNewFile implements Serializable {
+    public static class FileCreateNewFile implements Serializable {
         private static final long serialVersionUID = -1949115824823475728L;
         public final boolean ret;
 
@@ -2200,7 +2318,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileExists implements Serializable {
+    public static class FileExists implements Serializable {
         private static final long serialVersionUID = 2539456588280997741L;
         public final boolean ret;
 
@@ -2209,7 +2327,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileGetAbsoluteFile implements Serializable {
+    public static class FileGetAbsoluteFile implements Serializable {
         private static final long serialVersionUID = 5512595607004449365L;
         public final File ret;
 
@@ -2218,7 +2336,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileGetAbsolutePath implements Serializable {
+    public static class FileGetAbsolutePath implements Serializable {
         private static final long serialVersionUID = 6347986768603929179L;
         public final String ret;
 
@@ -2227,7 +2345,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileGetCanonicalFile implements Serializable {
+    public static class FileGetCanonicalFile implements Serializable {
         private static final long serialVersionUID = -2602211034593248454L;
         public final File ret;
 
@@ -2236,7 +2354,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileGetCanonicalPath implements Serializable {
+    public static class FileGetCanonicalPath implements Serializable {
         private static final long serialVersionUID = 5155015148720024491L;
         public final String ret;
 
@@ -2245,7 +2363,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileGetName implements Serializable {
+    public static class FileGetName implements Serializable {
         private static final long serialVersionUID = -3466414227998379811L;
         public final String ret;
 
@@ -2254,7 +2372,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileGetPath implements Serializable {
+    public static class FileGetPath implements Serializable {
         private static final long serialVersionUID = 2740765556256838133L;
         public final String ret;
 
@@ -2263,7 +2381,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileGetParentFile implements Serializable {
+    public static class FileGetParentFile implements Serializable {
         private static final long serialVersionUID = -4497910538424005170L;
         public final File ret;
 
@@ -2272,7 +2390,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileIsDirectory implements Serializable {
+    public static class FileIsDirectory implements Serializable {
         private static final long serialVersionUID = -1524919575881849250L;
         public final boolean ret;
 
@@ -2281,7 +2399,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileLength implements Serializable {
+    public static class FileLength implements Serializable {
         private static final long serialVersionUID = 2634594409135129500L;
         public final long ret;
 
@@ -2290,7 +2408,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileList implements Serializable {
+    public static class FileList implements Serializable {
         private static final long serialVersionUID = 8731278317227578603L;
         public final String[] ret;
 
@@ -2299,7 +2417,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    /*default*/ static class FileListFilter implements Serializable {
+    /*default*/ public static class FileListFilter implements Serializable {
         private static final long serialVersionUID = -8766884245044452682L;
         public final String[] unfiltered;
 
@@ -2308,7 +2426,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileListFiles implements Serializable {
+    public static class FileListFiles implements Serializable {
         private static final long serialVersionUID = -5119001235753128588L;
         public final File[] ret;
 
@@ -2317,7 +2435,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileListFilesFilter implements Serializable {
+    public static class FileListFilesFilter implements Serializable {
         private static final long serialVersionUID = 5926312547546983799L;
         public final File[] unfiltered;
 
@@ -2326,20 +2444,20 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileMkdir implements Serializable {
+    public static class FileMkdir implements Serializable {
         private static final long serialVersionUID = 3097647237497766240L;
         public final boolean ret;
         public FileMkdir(boolean ret) { this.ret = ret; }
     }
 
-    static class FileMkdirs implements Serializable {
+    public static class FileMkdirs implements Serializable {
         private static final long serialVersionUID = 2856519211731018476L;
         public final boolean ret;
         public FileMkdirs(boolean ret) { this.ret = ret; }
     }
 
 
-    static class FileRenameTo implements Serializable {
+    public static class FileRenameTo implements Serializable {
         private static final long serialVersionUID = 2926524963692438733L;
         public final boolean ret;
         public final File f;
@@ -2350,7 +2468,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileSetReadOnly implements Serializable {
+    public static class FileSetReadOnly implements Serializable {
         private static final long serialVersionUID = -2895509903845809085L;
         public final boolean ret;
 
@@ -2359,7 +2477,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileToURL implements Serializable {
+    public static class FileToURL implements Serializable {
         private static final long serialVersionUID = -3291163945452082024L;
         public final URL ret;
 
@@ -2368,7 +2486,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileLastModified implements Serializable {
+    public static class FileLastModified implements Serializable {
         private static final long serialVersionUID = -5851863238493584154L;
         public final long ret;
         public FileLastModified(long ret) {
@@ -2376,7 +2494,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class IsFile implements Serializable{
+    public static class IsFile implements Serializable{
         private static final long serialVersionUID = -2835638096061908902L;
         public final boolean ret;
         public IsFile(boolean ret) {
@@ -2384,7 +2502,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileOutputStreamOpen implements Serializable {
+    public static class FileOutputStreamOpen implements Serializable {
         private static final long serialVersionUID = -8895509075644283251L;
         public final String name;
         public final boolean append;
@@ -2395,7 +2513,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileInputStreamOpen implements Serializable {
+    public static class FileInputStreamOpen implements Serializable {
         private static final long serialVersionUID = -1980148051600649867L;
         public final String name;
 
@@ -2404,11 +2522,11 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class FileDescriptorSync implements Serializable {
+    public static class FileDescriptorSync implements Serializable {
         private static final long serialVersionUID = 6555690687761121811L;
     }
 
-    static class Connect implements Serializable {
+    public static class Connect implements Serializable {
         private static final long serialVersionUID = -5518083562481732343L;
         public SocketAddress endpoint;
         public int timeout;
@@ -2418,7 +2536,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class Bind implements Serializable {
+    public static class Bind implements Serializable {
         private static final long serialVersionUID = 2474132660619817310L;
         public SocketAddress endpoint;
         public int backlog;
@@ -2428,56 +2546,71 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class Accept implements Serializable {
+    public static class Accept implements Serializable {
         private static final long serialVersionUID = -3463609108315756653L;
         public Accept() {}
         //public int localPort;
         //public Accept(int port){this.localPort = port;}
     }
 
-    static class AcceptBegin implements Serializable{
+    public static class AcceptBegin implements Serializable{
         private static final long serialVersionUID = 7817326191653933018L;
         public AcceptBegin() {
         }
     }
 
-    static class AcceptEnd implements Serializable{
+    public static class AcceptEnd implements Serializable{
         private static final long serialVersionUID = 2577250288949774035L;
         public AcceptEnd() {
         }
     }
 
-    static class MonitorEnter implements Serializable {
+    public static class MonitorEnter implements Serializable {
         private static final long serialVersionUID = -1059341792896636602L;
         public final long[] clock;
+        public final byte tagByte;
+
         public MonitorEnter(long[] clock) {
+            this(clock, OptimizedEvent.MONITOR_ENTER);
+        }
+
+        public MonitorEnter(long[] clock, OptimizedEvent tag) {
             this.clock = clock;
+            this.tagByte = (byte)tag.ordinal();
         }
     }
 
-    static class Wait implements Serializable {
+    public static class Wait implements Serializable {
         private static final long serialVersionUID = -125207637055109316L;
         public final long[] clock;
+        public final int hashcode;
+        public final byte tagByte;
 
-        public Wait(long[] clock) {
+        public Wait(long[] clock, int hashcode) {
+            this(clock, hashcode, OptimizedEvent.WAIT);
+        }
+
+        public Wait(long[] clock, int hashcode, OptimizedEvent tag) {
             this.clock = clock;
+            this.hashcode = hashcode;
+            this.tagByte = (byte)tag.ordinal();
         }
     }
 
-    /*default*/ static class RARead implements Serializable {
+    /*default*/ public static class RARead implements Serializable {
         private static final long serialVersionUID = -5385942546610734976L;
         public final int ret;
         public RARead(int ret) { this.ret = ret; }
     }
 
-    /*default*/ static class RAReadB implements Serializable {
+    /*default*/ public static class RAReadB implements Serializable {
         private static final long serialVersionUID = 6283512089592128395L;
         public final int ret;
         public final byte[] b;
         public RAReadB(int ret, byte[] b) { this.ret = ret; this.b = b; }
     }
 
-    /*default*/ static class RAReadBII implements Serializable {
+    /*default*/ public static class RAReadBII implements Serializable {
         private static final long serialVersionUID = 5350319809033626351L;
         public final int ret;
         public final byte[] b;
@@ -2490,7 +2623,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class RAOpen implements Serializable {
+    public static class RAOpen implements Serializable {
         private static final long serialVersionUID = 7299414554108795266L;
         public final String name;
         public final int mode;
@@ -2501,19 +2634,19 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    /*default*/ static class RAWrite implements Serializable {
+    /*default*/ public static class RAWrite implements Serializable {
         private static final long serialVersionUID = 6208884415621475682L;
         public final int b;
         public RAWrite(int b) { this.b = b; }
     }
 
-    /*default*/ static class RAWriteB implements Serializable {
+    /*default*/ public static class RAWriteB implements Serializable {
         private static final long serialVersionUID = 5413983382540899826L;
         public final byte[] b;
         public RAWriteB(byte[] b) { this.b = b; }
     }
 
-    /*default*/ static class RAWriteBII implements Serializable {
+    /*default*/ public static class RAWriteBII implements Serializable {
         private static final long serialVersionUID = 5579457088785271345L;
         public final byte[] b;
         public final int off, len;
@@ -2524,7 +2657,7 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class RALength implements Serializable{
+    public static class RALength implements Serializable{
         private static final long serialVersionUID = 1248459452001320354L;
         public long len;
         public RALength(long len) {
@@ -2532,13 +2665,13 @@ public class Leader implements JMVXStrategy {
         }
     }
 
-    static class RASeek implements Serializable{
+    public static class RASeek implements Serializable{
         private static final long serialVersionUID = 375470715892433022L;
         public long pos;
         public RASeek(long pos){ this.pos = pos; }
     }
 
-    static class RASetLength implements Serializable{
+    public static class RASetLength implements Serializable{
         private static final long serialVersionUID = 7251967962539238084L;
         public long newLength;
 
@@ -2965,6 +3098,14 @@ public class Leader implements JMVXStrategy {
         public NativeRealPath(String path, byte[] ret) {
             this.path = path;
             this.ret = ret;
+        }
+    }
+
+    public static class JobStarted implements Serializable {
+        private static final long serialVersionUID = -1342271281473340425L;
+        public final int stamp;
+        public JobStarted(int stamp) {
+            this.stamp = stamp;
         }
     }
 }

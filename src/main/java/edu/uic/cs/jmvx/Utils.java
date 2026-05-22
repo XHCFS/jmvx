@@ -2,7 +2,11 @@ package edu.uic.cs.jmvx;
 
 import java.nio.ByteBuffer;
 import java.util.zip.CRC32;
+import java.util.zip.ZipFile;
+
 import edu.uic.cs.jmvx.runtime.JMVXInputStream;
+import edu.uic.cs.jmvx.runtime.JMVXRuntime;
+import sun.nio.ch.ChannelInputStream;
 
 public class Utils {
     // from: https://stackoverflow.com/questions/4485128/how-do-i-convert-long-to-byte-and-back-in-java
@@ -32,7 +36,15 @@ public class Utils {
     }
 
     public static boolean isInputStreamFromDisk(JMVXInputStream is) {
-        if (is instanceof java.io.FileInputStream) {
+        /* Explicit check for ChannelInputStream is a hack for dacapo
+         * which uses it to wrap a FileChannelImpl
+         * However, ChannelInputStream relies on InputStream.read(byte[]), so just adding to a deny list
+         * causes us to leave a path for ChannelInputStream events to be logged
+         * If we detect it here, we can avoid the issue
+         */
+        if (is instanceof java.io.FileInputStream ||
+                is instanceof ChannelInputStream  ||
+                is.getClass().equals(JMVXRuntime.zipFileInputStreamClass)) {
             return true;
         }
         return false;

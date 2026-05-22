@@ -50,8 +50,7 @@ public abstract class RenameClassVisitor extends ClassVisitor implements Opcodes
         if (enabled) {
             logger.info("Found: " + name);
             // Add JMVX interface to found type
-            if (interfaces == null) interfaces = new String[0];
-            interfaces = Stream.concat(Arrays.stream(interfaces), Stream.of(JMVX_TYPE.getInternalName())).toArray(String[]::new);
+            interfaces = BytecodeUtils.addInterface(interfaces, JMVX_TYPE);
         }
 
         super.visit(version, access, name, signature, superName, interfaces);
@@ -67,7 +66,7 @@ public abstract class RenameClassVisitor extends ClassVisitor implements Opcodes
 
         if (!methodName.equals(name)) {
             // Method was renamed, we need to generate the original method
-            this.methodsToGenerate.add(new MethodNode(0, name, descriptor, null, null));
+            this.methodsToGenerate.add(new MethodNode(0, name, descriptor, signature, exceptions));
             access = (access & (~ACC_PRIVATE) & (~ACC_PROTECTED) | ACC_PUBLIC);
         }
 

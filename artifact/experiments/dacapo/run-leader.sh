@@ -15,9 +15,10 @@ if [ "$CIRC_BUFFER" != "" ]; then
 	echo "Set circ buffer to $CIRC_BUFFER"
 fi
 
+
 DUMP=""
 if [ "$CORE_DUMP" != "" ]; then
-	DUMP="-DcoreDumpAtEnd=$CORE_DUMP"
+        DUMP="-c CoreDumpCallback"
 fi
 
-$JAVA_HOME/bin/java $MEM -Dlogfile="leader.log" $CIRC $DUMP -Xbootclasspath/p:$INSTALL_DIR/rt.jar:$JMVX_JAR $DEBUG $INPUT_ROLE -cp $DACAPO_INSTRUMENTED Harness $@
+$JAVA_HOME/bin/java $MEM -Dlogfile="leader.log" $CIRC -Xbootclasspath/p:$INSTALL_DIR/rt.jar:$JMVX_JAR $DEBUG $INPUT_ROLE -cp $DACAPO_INSTRUMENTED Harness $DUMP $@
