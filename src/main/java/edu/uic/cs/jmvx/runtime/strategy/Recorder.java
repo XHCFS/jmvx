@@ -740,12 +740,12 @@ public class Recorder extends Leader {
             // Don't log monitors inside class initializers
             // These should be able to be run by any thread
             // Just get the lock
-            JMVXRuntime.unsafe.monitorEnter(o);
+            JMVXMonitor.enter(o);
             return;
         }
 
 
-        JMVXRuntime.unsafe.monitorEnter(o);
+        JMVXMonitor.enter(o);
         /* The clock needs to be incremented no matter what
         * The replayer needs to know how long to wait while on the slow path
         * Incrementing on the fast path performs this bookkeeping
@@ -1052,13 +1052,13 @@ public class Recorder extends Leader {
     }
 
     @Override
-    public long getEntry(long jzfile, byte[] name, boolean addSlash) {
-        long ret = JMVXRuntime.zipfile.$JMVX$getEntry(jzfile, name, addSlash);
+    public long getEntry(long jzfile, byte[] name) {
+        long ret = JMVXRuntime.zipfile.$JMVX$getEntry(jzfile, name);
         String rawPath = openedZips.get(jzfile);
         if(loading == 0){
             if(rawPath != null)
                 jarsManifest.putIfAbsent(rawPath, rawPath);
-            sendObjectToCoordinator(new Recorder.GetEntry(jzfile, name, addSlash, -ret));
+            sendObjectToCoordinator(new Recorder.GetEntry(jzfile, name, -ret));
         }else{ //got an entry during loading, prep it for logging
             if(rawPath != null){
                 if(loggableJar(rawPath)) //Program jar, copied to recordingDir later in flushData
@@ -1066,7 +1066,7 @@ public class Recorder extends Leader {
                 else //JDK jar, path is valid unchanged
                     jarsManifest.put(rawPath, rawPath);
             } //if rawPath is null, then the Jar was opened before JMVX was init'ed and will be okay during replay
-            //sendObjectToCoordinator(new Recorder.GetEntry(jzfile, name, addSlash, ret));
+            //sendObjectToCoordinator(new Recorder.GetEntry(jzfile, name, ret));
         }
         return ret;
     }
@@ -1121,6 +1121,14 @@ public class Recorder extends Leader {
         int ret = JMVXRuntime.zipfile.$JMVX$getTotal(jzfile);
         if(loading == 0)
             sendObjectToCoordinator(new Recorder.GetTotal(jzfile, ret));
+        return ret;
+    }
+
+    @Override
+    public int getManifestNum(long jzfile) {
+        int ret = JMVXRuntime.zipfile.$JMVX$getManifestNum(jzfile);
+        if(loading == 0)
+            sendObjectToCoordinator(new Recorder.GetManifestNum(jzfile, ret));
         return ret;
     }
 
@@ -1253,12 +1261,10 @@ public class Recorder extends Leader {
         public long ret;
         public long jzfile;
         public byte[] name;
-        public boolean addSlash;
-        public GetEntry(long jzfile, byte[] name, boolean addSlash, long ret) {
+        public GetEntry(long jzfile, byte[] name, long ret) {
             this.ret = ret;
             this.jzfile = jzfile;
             this.name = name;
-            this.addSlash = addSlash;
         }
     }
 
@@ -1317,6 +1323,17 @@ public class Recorder extends Leader {
         public int ret;
 
         public GetTotal(long jzfile, int ret) {
+            this.jzfile = jzfile;
+            this.ret = ret;
+        }
+    }
+
+    public static class GetManifestNum implements Serializable {
+        private static final long serialVersionUID = 5603188913377412011L;
+        public long jzfile;
+        public int ret;
+
+        public GetManifestNum(long jzfile, int ret) {
             this.jzfile = jzfile;
             this.ret = ret;
         }

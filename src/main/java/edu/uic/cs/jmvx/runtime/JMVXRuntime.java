@@ -703,7 +703,7 @@ public class JMVXRuntime {
         getStrategy().monitorenter(o);
     }
 
-    public static void monitorexit(Object o) { unsafe.monitorExit(o); }
+    public static void monitorexit(Object o) { JMVXMonitor.exit(o); }
 
     public static void wait(Object o) throws InterruptedException {
         getStrategy().wait(o, 0, 0);
@@ -868,8 +868,8 @@ public class JMVXRuntime {
     public static void initIDs(){
         getStrategy().initIDs();
     }
-    public static long getEntry(long jzfile, byte[] name, boolean addSlash){
-        return getStrategy().getEntry(jzfile, name, addSlash);
+    public static long getEntry(long jzfile, byte[] name){
+        return getStrategy().getEntry(jzfile, name);
     }
     public static void freeEntry(long jzfile, long jzentry){
         getStrategy().freeEntry(jzfile, jzentry);
@@ -885,6 +885,10 @@ public class JMVXRuntime {
     }
     public static int getTotal(long jzfile){
         return getStrategy().getTotal(jzfile);
+    }
+
+    public static int getManifestNum(long jzfile){
+        return getStrategy().getManifestNum(jzfile);
     }
     public static boolean startsWithLOC(long jzfile){
         return getStrategy().startsWithLOC(jzfile);

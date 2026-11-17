@@ -121,8 +121,8 @@ public class FollowerRecorder extends ReentrantStrategy<FollowerRecorderImpl, Re
     }
 
     @Override
-    public long getEntry(long jzfile, byte[] name, boolean addSlash) {
-        return passthrough.getEntry(jzfile, name, addSlash);
+    public long getEntry(long jzfile, byte[] name) {
+        return passthrough.getEntry(jzfile, name);
     }
 
     @Override
@@ -148,6 +148,11 @@ public class FollowerRecorder extends ReentrantStrategy<FollowerRecorderImpl, Re
     @Override
     public int getTotal(long jzfile) {
         return passthrough.getTotal(jzfile);
+    }
+
+    @Override
+    public int getManifestNum(long jzfile) {
+        return passthrough.getManifestNum(jzfile);
     }
 
     @Override

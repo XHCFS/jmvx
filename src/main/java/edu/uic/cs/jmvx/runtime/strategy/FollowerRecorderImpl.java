@@ -168,7 +168,7 @@ public class FollowerRecorderImpl implements JMVXStrategy {
     }
 
     @Override
-    public long getEntry(long jzfile, byte[] name, boolean addSlash) {
+    public long getEntry(long jzfile, byte[] name) {
         throw new UnsupportedOperationException("Should be diverted to recorder");
     }
 
@@ -194,6 +194,11 @@ public class FollowerRecorderImpl implements JMVXStrategy {
 
     @Override
     public int getTotal(long jzfile) {
+        throw new UnsupportedOperationException("Should be diverted to recorder");
+    }
+
+    @Override
+    public int getManifestNum(long jzfile) {
         throw new UnsupportedOperationException("Should be diverted to recorder");
     }
 

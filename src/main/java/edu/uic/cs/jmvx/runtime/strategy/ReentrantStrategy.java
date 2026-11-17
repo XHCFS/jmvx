@@ -740,10 +740,10 @@ public class ReentrantStrategy <Strategy extends JMVXStrategy, Passthrough exten
     }
 
     @Override
-    public long getEntry(long jzfile, byte[] name, boolean addSlash) {
+    public long getEntry(long jzfile, byte[] name) {
         enter();
         try{
-            return this.inUse.getEntry(jzfile, name, addSlash);
+            return this.inUse.getEntry(jzfile, name);
         }finally {
             exit();
         }
@@ -794,6 +794,16 @@ public class ReentrantStrategy <Strategy extends JMVXStrategy, Passthrough exten
         enter();
         try{
             return this.inUse.getTotal(jzfile);
+        }finally {
+            exit();
+        }
+    }
+
+    @Override
+    public int getManifestNum(long jzfile) {
+        enter();
+        try{
+            return this.inUse.getManifestNum(jzfile);
         }finally {
             exit();
         }

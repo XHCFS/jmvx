@@ -217,8 +217,8 @@ public interface JMVXStrategy {
     public default void initIDs(){
         JMVXRuntime.zipfile.$JMVX$initIDs();
     }
-    public default long getEntry(long jzfile, byte[] name, boolean addSlash){
-        return JMVXRuntime.zipfile.$JMVX$getEntry(jzfile, name, addSlash);
+    public default long getEntry(long jzfile, byte[] name){
+        return JMVXRuntime.zipfile.$JMVX$getEntry(jzfile, name);
     }
     public default void freeEntry(long jzfile, long jzentry){
         /*
@@ -244,6 +244,10 @@ public interface JMVXStrategy {
     }
     public default int getTotal(long jzfile){
         return JMVXRuntime.zipfile.$JMVX$getTotal(jzfile);
+    }
+
+    public default int getManifestNum(long jzfile){
+        return JMVXRuntime.zipfile.$JMVX$getManifestNum(jzfile);
     }
     public default boolean startsWithLOC(long jzfile){
         return JMVXRuntime.zipfile.$JMVX$startsWithLOC(jzfile);
