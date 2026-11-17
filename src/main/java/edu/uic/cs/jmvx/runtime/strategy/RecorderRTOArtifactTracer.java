@@ -1,5 +1,6 @@
 package edu.uic.cs.jmvx.runtime.strategy;
 
+import edu.uic.cs.jmvx.runtime.JMVXMonitor;
 import edu.uic.cs.jmvx.runtime.JMVXRuntime;
 import edu.uic.cs.jmvx.runtime.util.OptimizedEvent;
 import edu.uic.cs.jmvx.runtime.util.UIDedObject;
@@ -109,13 +110,13 @@ public class RecorderRTOArtifactTracer extends RecorderWithPools {
             // Don't log monitors inside class initializers
             // These should be able to be run by any thread
             // Just get the lock
-            JMVXRuntime.unsafe.monitorEnter(o);
+            JMVXMonitor.enter(o);
             return;
         }
 
         errIfWorkerWithoutTask();
 
-        JMVXRuntime.unsafe.monitorEnter(o);
+        JMVXMonitor.enter(o);
         /* The clock needs to be incremented no matter what
          * The replayer needs to know how long to wait while on the slow path
          * Incrementing on the fast path performs this bookkeeping

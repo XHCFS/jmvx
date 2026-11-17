@@ -703,7 +703,7 @@ public class JMVXRuntime {
         getStrategy().monitorenter(o);
     }
 
-    public static void monitorexit(Object o) { unsafe.monitorExit(o); }
+    public static void monitorexit(Object o) { JMVXMonitor.exit(o); }
 
     public static void wait(Object o) throws InterruptedException {
         getStrategy().wait(o, 0, 0);

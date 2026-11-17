@@ -739,7 +739,7 @@ public class Replayer extends Follower{
     public void monitorenter(Object o) {
         /* Uncertain which thread initializes a class, for skip it */
         if (inClinit > 0 || loading > 0) {
-            JMVXRuntime.unsafe.monitorEnter(o);
+            JMVXMonitor.enter(o);
             return;
         }
 
@@ -753,7 +753,7 @@ public class Replayer extends Follower{
                 OptimizedEvent tag = OptimizedEvent.readTag(this.fromCoordinator);
                 switch (tag){
                     case SINGLE_THREADED: //avoid vc
-                        JMVXRuntime.unsafe.monitorEnter(o);
+                        JMVXMonitor.enter(o);
                         return;
                     case MONITOR_ENTER: //sync needed
                         int size = this.fromCoordinator.readInt();
@@ -775,7 +775,7 @@ public class Replayer extends Follower{
                         JMVXRuntime.clock.sync(vectorClockIndex, clockCopy, true);
                         //fallthrough to acquire monitor and increment
                     case FAST_MONITOR_ENTER: //just increment
-                        JMVXRuntime.unsafe.monitorEnter(o);
+                        JMVXMonitor.enter(o);
                         JMVXRuntime.clock.increment(vectorClockIndex, null);
                         return;
                     default:
@@ -812,7 +812,7 @@ public class Replayer extends Follower{
                 //is a fast wait even possible? That would mean either we notified ourselves,
                 //or we had a spurious wakeup.
                 while(Thread.holdsLock(o)) {
-                    JMVXRuntime.unsafe.monitorExit(o);
+                    JMVXMonitor.exit(o);
                     i++;
                 }
 
@@ -820,7 +820,7 @@ public class Replayer extends Follower{
                 switch (tag){
                     case SINGLE_THREADED: //avoid vc
                         for(; i != 0; i--)
-                            JMVXRuntime.unsafe.monitorEnter(o);
+                            JMVXMonitor.enter(o);
                         return;
                     case WAIT: //sync needed
                         int size = this.fromCoordinator.readInt();
@@ -843,7 +843,7 @@ public class Replayer extends Follower{
                         //fallthrough to acquire monitor and increment
                     case FAST_WAIT: //just increment
                         for(; i != 0; i--)
-                            JMVXRuntime.unsafe.monitorEnter(o);
+                            JMVXMonitor.enter(o);
                         JMVXRuntime.clock.increment(vectorClockIndex, null);
                         return;
                     default:

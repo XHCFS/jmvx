@@ -740,12 +740,12 @@ public class Recorder extends Leader {
             // Don't log monitors inside class initializers
             // These should be able to be run by any thread
             // Just get the lock
-            JMVXRuntime.unsafe.monitorEnter(o);
+            JMVXMonitor.enter(o);
             return;
         }
 
 
-        JMVXRuntime.unsafe.monitorEnter(o);
+        JMVXMonitor.enter(o);
         /* The clock needs to be incremented no matter what
         * The replayer needs to know how long to wait while on the slow path
         * Incrementing on the fast path performs this bookkeeping
